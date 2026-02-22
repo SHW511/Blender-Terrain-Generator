@@ -18,13 +18,18 @@ jobs:
       - name: Get version
         id: version
         run: |
-          VERSION=$(grep '^version' blender_manifest.toml | sed 's/version = "\(.*\)"/\1/')
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version\s*=' blender_manifest.toml | sed 's/^version\s*=\s*"\(.*\)".*/\1/')
+          if [ -z "$VERSION" ]; then
+            echo "Error: VERSION not found in blender_manifest.toml" >&2
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Create zip
         run: |
-          zip dnd_tile_forge-${{ steps.version.outputs.version }}.zip \
-            *.py \
+          zip -r dnd_tile_forge-${{ steps.version.outputs.version }}.zip \
+            $(find . -name "*.py" -not -path "./.git/*") \
             blender_manifest.toml
 
       - name: Create release
