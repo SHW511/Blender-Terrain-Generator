@@ -86,9 +86,13 @@ class TILEFORGE_OT_GenerateTerrain(Operator):
             mesh_gen.clamp_slopes(obj, outdoor.max_slope_angle)
 
         # River channel (after erosion/clamping — intentional carving)
+        if outdoor.add_river and outdoor.river_curve is None:
+            self.report({'WARNING'}, "River enabled but no curve assigned — skipping")
         mesh_gen.apply_river_channel(obj, outdoor, tile)
 
         # Path / road (after erosion — flattens to average height)
+        if outdoor.add_path and outdoor.path_curve is None:
+            self.report({'WARNING'}, "Path enabled but no curve assigned — skipping")
         mesh_gen.apply_path(obj, outdoor, tile)
 
         # Ground texture (last detail pass — micro-displacement)

@@ -262,14 +262,21 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
         # Terrain features
         box = layout.box()
         box.label(text="Terrain Features", icon='MESH_PLANE')
+
         col = box.column(align=True)
         col.prop(outdoor, "add_river")
         if outdoor.add_river:
+            col.prop(outdoor, "river_curve")
             col.prop(outdoor, "river_width")
             col.prop(outdoor, "river_depth")
+            col.prop(outdoor, "river_meander_strength")
 
+        box.separator()
+
+        col = box.column(align=True)
         col.prop(outdoor, "add_path")
         if outdoor.add_path:
+            col.prop(outdoor, "path_curve")
             col.prop(outdoor, "path_width")
 
         layout.separator()

@@ -652,6 +652,12 @@ class TILEFORGE_PG_OutdoorSettings(PropertyGroup):
         description="Cut a river channel across the terrain",
         default=False,
     )
+    river_curve: PointerProperty(
+        name="River Curve",
+        description="Curve object defining the river centerline",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'CURVE',
+    )
     river_width: FloatProperty(
         name="River Width (m)",
         description="Width of the river channel in world meters",
@@ -670,11 +676,26 @@ class TILEFORGE_PG_OutdoorSettings(PropertyGroup):
         step=5,
         precision=2,
     )
+    river_meander_strength: FloatProperty(
+        name="Meander Strength",
+        description="Noise wobble perpendicular to the curve for organic edges",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        step=5,
+        precision=2,
+    )
 
     add_path: BoolProperty(
         name="Add Path / Road",
         description="Flatten a path across the terrain",
         default=False,
+    )
+    path_curve: PointerProperty(
+        name="Path Curve",
+        description="Curve object defining the path/road centerline",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'CURVE',
     )
     path_width: FloatProperty(
         name="Path Width (m)",

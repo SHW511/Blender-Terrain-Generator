@@ -901,14 +901,141 @@ def _texture_dirt(bm, half_x, half_y, strength, floor_only_z):
 
 
 # ---------------------------------------------------------------------------
+# Curve evaluation helpers
+# ---------------------------------------------------------------------------
+
+def _evaluate_curve_to_polyline(curve_obj):
+    """Convert a curve object to an ordered list of world-space Vector points.
+
+    Handles Bezier, NURBS, and Poly curves uniformly by converting to a
+    temporary mesh via the dependency graph.
+
+    Args:
+        curve_obj: A Blender object of type CURVE
+
+    Returns:
+        List of Vector points in world space, ordered along the curve
+    """
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = curve_obj.evaluated_get(depsgraph)
+    temp_mesh = bpy.data.meshes.new_from_object(eval_obj)
+
+    if not temp_mesh.vertices:
+        bpy.data.meshes.remove(temp_mesh)
+        return []
+
+    # Build adjacency from edges to walk the vertex chain in order
+    adj = {}
+    for edge in temp_mesh.edges:
+        a, b = edge.vertices[0], edge.vertices[1]
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+
+    # Find a degree-1 endpoint to start from (open curve), or pick arbitrary
+    start = 0
+    for vi, neighbors in adj.items():
+        if len(neighbors) == 1:
+            start = vi
+            break
+
+    # Walk the chain
+    ordered = [start]
+    visited = {start}
+    current = start
+    while True:
+        neighbors = adj.get(current, [])
+        found = False
+        for nb in neighbors:
+            if nb not in visited:
+                visited.add(nb)
+                ordered.append(nb)
+                current = nb
+                found = True
+                break
+        if not found:
+            break
+
+    # Transform to world space
+    mat = curve_obj.matrix_world
+    points = [mat @ temp_mesh.vertices[vi].co.copy() for vi in ordered]
+
+    bpy.data.meshes.remove(temp_mesh)
+    return points
+
+
+def _point_to_segment_dist(p, a, b):
+    """Compute XY distance from point p to line segment a-b (Z ignored for distance).
+
+    Args:
+        p: Query point (Vector)
+        a: Segment start (Vector)
+        b: Segment end (Vector)
+
+    Returns:
+        (distance, closest_point, t_parameter) where t is 0..1 along the segment
+    """
+    ab = Vector((b.x - a.x, b.y - a.y))
+    ap = Vector((p.x - a.x, p.y - a.y))
+    ab_sq = ab.x * ab.x + ab.y * ab.y
+
+    if ab_sq < 1e-12:
+        dist = math.sqrt(ap.x * ap.x + ap.y * ap.y)
+        return (dist, a.copy(), 0.0)
+
+    t = max(0.0, min(1.0, (ap.x * ab.x + ap.y * ab.y) / ab_sq))
+    closest = Vector((a.x + t * ab.x, a.y + t * ab.y, a.z + t * (b.z - a.z)))
+    dx = p.x - closest.x
+    dy = p.y - closest.y
+    dist = math.sqrt(dx * dx + dy * dy)
+    return (dist, closest, t)
+
+
+def _closest_point_on_polyline(p, polyline):
+    """Find the closest point on a polyline to point p (XY distance).
+
+    Args:
+        p: Query point (Vector)
+        polyline: List of Vector points defining the polyline
+
+    Returns:
+        (min_distance, closest_point, tangent_2d) where tangent is a unit
+        vector along the curve at the closest point
+    """
+    best_dist = float('inf')
+    best_point = polyline[0].copy() if polyline else Vector((0, 0, 0))
+    best_seg_idx = 0
+    best_t = 0.0
+
+    for i in range(len(polyline) - 1):
+        dist, cp, t = _point_to_segment_dist(p, polyline[i], polyline[i + 1])
+        if dist < best_dist:
+            best_dist = dist
+            best_point = cp
+            best_seg_idx = i
+            best_t = t
+
+    # Compute tangent along the segment
+    a = polyline[best_seg_idx]
+    b = polyline[min(best_seg_idx + 1, len(polyline) - 1)]
+    tang = Vector((b.x - a.x, b.y - a.y))
+    length = math.sqrt(tang.x * tang.x + tang.y * tang.y)
+    if length > 1e-10:
+        tang /= length
+    else:
+        tang = Vector((1.0, 0.0))
+
+    return (best_dist, best_point, tang)
+
+
+# ---------------------------------------------------------------------------
 # River channel
 # ---------------------------------------------------------------------------
 
 def apply_river_channel(obj, settings_outdoor, settings_tile):
-    """Carve a meandering river channel across the terrain along the Y axis.
+    """Carve a river channel along a user-defined curve centerline.
 
-    Uses sine wave + noise wobble for meanders, cosine U-shape cross-section.
-    Purely subtractive — only lowers Z.
+    Uses cosine U-shape cross-section. Optional meander noise adds organic
+    wobble perpendicular to the curve. Purely subtractive — only lowers Z.
 
     Args:
         obj: Blender mesh object
@@ -917,29 +1044,34 @@ def apply_river_channel(obj, settings_outdoor, settings_tile):
     """
     if not settings_outdoor.add_river:
         return
+    if settings_outdoor.river_curve is None:
+        return
+
+    polyline = _evaluate_curve_to_polyline(settings_outdoor.river_curve)
+    if len(polyline) < 2:
+        return
+
+    # Transform curve world-space points into terrain object local space
+    mat_inv = obj.matrix_world.inverted()
+    polyline = [mat_inv @ p for p in polyline]
 
     mesh = obj.data
     bm = bmesh.new()
     bm.from_mesh(mesh)
 
     print_scale = settings_tile.print_scale
-    half_x = m(settings_tile.map_width, print_scale) / 2.0
-    half_y = m(settings_tile.map_depth, print_scale) / 2.0
     river_half_w = m(settings_outdoor.river_width, print_scale) / 2.0
     depth = m(settings_outdoor.river_depth, print_scale)
-
-    # Meander parameters
-    amplitude = half_x * 0.25  # 25% of half-map-width
-    freq = 2.0 * (2.0 * math.pi) / (2.0 * half_y)  # 2 full waves across map
+    meander = settings_outdoor.river_meander_strength
 
     for v in bm.verts:
-        # Meander center: sine wave along Y + noise wobble
-        y_norm = (v.co.y + half_y) / (2.0 * half_y) if half_y > 0 else 0.5
-        wobble = mathnoise.noise(Vector((y_norm * 3.0, 0.5, 0.0)))
-        center_x = amplitude * math.sin(v.co.y * freq) + wobble * amplitude * 0.3
+        dist, closest, tangent = _closest_point_on_polyline(v.co, polyline)
 
-        # Distance from river center line
-        dist = abs(v.co.x - center_x)
+        # Meander: noise wobble shifts the effective distance
+        if meander > 0.0:
+            noise_sample = Vector((closest.x * 3.0, closest.y * 3.0, 0.0))
+            wobble = mathnoise.noise(noise_sample)
+            dist = max(0.0, dist + wobble * river_half_w * meander)
 
         if dist < river_half_w:
             # Cosine U-shape cross-section
@@ -958,7 +1090,7 @@ def apply_river_channel(obj, settings_outdoor, settings_tile):
 # ---------------------------------------------------------------------------
 
 def apply_path(obj, settings_outdoor, settings_tile):
-    """Flatten a diagonal path across the terrain (SW to NE).
+    """Flatten a path along a user-defined curve centerline.
 
     Two-pass algorithm: first collects average height of core path vertices,
     then flattens core to 80% average + 20% original, with cosine blend edges.
@@ -970,28 +1102,36 @@ def apply_path(obj, settings_outdoor, settings_tile):
     """
     if not settings_outdoor.add_path:
         return
+    if settings_outdoor.path_curve is None:
+        return
+
+    polyline = _evaluate_curve_to_polyline(settings_outdoor.path_curve)
+    if len(polyline) < 2:
+        return
+
+    # Transform curve world-space points into terrain object local space
+    mat_inv = obj.matrix_world.inverted()
+    polyline = [mat_inv @ p for p in polyline]
 
     mesh = obj.data
     bm = bmesh.new()
     bm.from_mesh(mesh)
+    bm.verts.ensure_lookup_table()
 
     print_scale = settings_tile.print_scale
     path_half_w = m(settings_outdoor.path_width, print_scale) / 2.0
     blend_zone = path_half_w * 0.5  # 50% of path width for gradual transition
     total_half_w = path_half_w + blend_zone
 
-    # Path direction: diagonal SW->NE — (1,1,0) normalized
-    inv_sqrt2 = 1.0 / math.sqrt(2.0)
-    # Perpendicular direction for distance calculation
-    perp_x = -inv_sqrt2
-    perp_y = inv_sqrt2
-
-    # Pass 1: collect core vertex heights
+    # Pass 1: collect core vertex heights and cache distances
     core_heights = []
+    vert_dists = {}  # vert index -> distance to polyline
     for v in bm.verts:
-        dist = abs(v.co.x * perp_x + v.co.y * perp_y)
-        if dist <= path_half_w:
-            core_heights.append(v.co.z)
+        dist, _, _ = _closest_point_on_polyline(v.co, polyline)
+        if dist <= total_half_w:
+            vert_dists[v.index] = dist
+            if dist <= path_half_w:
+                core_heights.append(v.co.z)
 
     if not core_heights:
         bm.free()
@@ -999,9 +1139,11 @@ def apply_path(obj, settings_outdoor, settings_tile):
 
     avg_height = sum(core_heights) / len(core_heights)
 
-    # Pass 2: flatten
+    # Pass 2: flatten using cached distances
     for v in bm.verts:
-        dist = abs(v.co.x * perp_x + v.co.y * perp_y)
+        dist = vert_dists.get(v.index)
+        if dist is None:
+            continue
 
         if dist <= path_half_w:
             # Core: 80% average + 20% original
