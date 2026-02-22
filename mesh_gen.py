@@ -1564,6 +1564,8 @@ def engrave_grid_lines(obj, settings_tile):
             )
 
     bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.normal_update()
 
     # --- Displace surface vertices inside groove strips --------------------
     # Base vertices sit at the mesh minimum Z; skip them.
@@ -1578,6 +1580,16 @@ def engrave_grid_lines(obj, settings_tile):
 
     for v in bm.verts:
         if v.co.z <= base_threshold:
+            continue
+
+        # Skip side-wall vertices: any linked face with a near-vertical normal
+        # (normal.z close to 0) means this vertex is on a wall, not the surface.
+        is_side_wall = False
+        for f in v.link_faces:
+            if abs(f.normal.z) < 0.1:
+                is_side_wall = True
+                break
+        if is_side_wall:
             continue
 
         in_groove = False
