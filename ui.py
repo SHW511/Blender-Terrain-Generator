@@ -3,6 +3,8 @@ UI Panels for D&D Tile Forge.
 Organized as a sidebar panel in the 3D Viewport under the 'Tile Forge' tab.
 """
 
+import math
+
 import bpy
 from bpy.types import Panel
 
@@ -65,7 +67,6 @@ class TILEFORGE_PT_TileSettings(TILEFORGE_PT_Base, Panel):
         col.prop(tile, "base_height")
 
         # Show tile count that slicing will produce
-        import math
         cols = max(1, math.floor(tile.map_width / tile.tile_size_x))
         rows = max(1, math.floor(tile.map_depth / tile.tile_size_y))
         box = layout.box()
@@ -81,8 +82,28 @@ class TILEFORGE_PT_TileSettings(TILEFORGE_PT_Base, Panel):
         col = layout.column(align=True)
         col.prop(tile, "engrave_grid")
         if tile.engrave_grid:
+            col.prop(tile, "grid_squares")
             col.prop(tile, "grid_line_depth")
             col.prop(tile, "grid_line_width")
+
+        layout.separator()
+
+        # Print dimensions info
+        ps = tile.print_scale
+        tile_mm_x = tile.tile_size_x / ps * 1000
+        tile_mm_y = tile.tile_size_y / ps * 1000
+        grid_sq = tile.grid_squares
+        grid_mm_x = tile_mm_x / grid_sq
+        grid_sq_y = max(1, round(tile.tile_size_y / (tile.tile_size_x / grid_sq)))
+        grid_mm_y = tile_mm_y / grid_sq_y
+        map_mm_x = tile.map_width / ps * 1000
+        map_mm_y = tile.map_depth / ps * 1000
+
+        box = layout.box()
+        box.label(text="Print Dimensions", icon='DRIVER_DISTANCE')
+        box.label(text=f"  Tile: {tile_mm_x:.1f} x {tile_mm_y:.1f} mm")
+        box.label(text=f"  Grid square: {grid_mm_x:.1f} x {grid_mm_y:.1f} mm")
+        box.label(text=f"  Map total: {map_mm_x:.1f} x {map_mm_y:.1f} mm")
 
         layout.separator()
 
@@ -120,6 +141,49 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
 
         if outdoor.terrain_type == "CUSTOM":
             col.prop(outdoor, "heightmap_image")
+
+            # Crop margins
+            crop_box = col.box()
+            crop_box.label(text="Crop Margins", icon='FULLSCREEN_EXIT')
+            row = crop_box.row(align=True)
+            row.prop(outdoor, "crop_left", text="L")
+            row.prop(outdoor, "crop_right", text="R")
+            row = crop_box.row(align=True)
+            row.prop(outdoor, "crop_top", text="T")
+            row.prop(outdoor, "crop_bottom", text="B")
+
+        elif outdoor.terrain_type == "MAP_IMAGE":
+            col.prop(outdoor, "heightmap_image")
+
+            # Crop margins
+            crop_box = col.box()
+            crop_box.label(text="Crop Margins", icon='FULLSCREEN_EXIT')
+            row = crop_box.row(align=True)
+            row.prop(outdoor, "crop_left", text="L")
+            row.prop(outdoor, "crop_right", text="R")
+            row = crop_box.row(align=True)
+            row.prop(outdoor, "crop_top", text="T")
+            row.prop(outdoor, "crop_bottom", text="B")
+
+            col.separator()
+
+            # Color zones
+            zone_box = col.box()
+            zone_box.label(text="Color Zones", icon='COLOR')
+            for i, zone in enumerate(outdoor.color_zones):
+                row = zone_box.row(align=True)
+                row.prop(zone, "color", text="")
+                row.prop(zone, "zone_name", text="")
+                row.prop(zone, "height", text="H", slider=True)
+                row.prop(zone, "tolerance", text="T", slider=True)
+            row = zone_box.row(align=True)
+            row.operator("tileforge.add_color_zone", text="Add Zone", icon='ADD')
+            row.operator("tileforge.remove_color_zone", text="Remove", icon='REMOVE')
+
+            col.separator()
+            col.prop(outdoor, "map_smoothing")
+            col.prop(outdoor, "fallback_height")
+
         else:
             col.prop(outdoor, "noise_type")
             if outdoor.noise_type != 'VORONOI':
@@ -147,14 +211,22 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
         col.prop(outdoor, "height_exponent")
         col.prop(outdoor, "subdivisions")
 
+        # Show physical relief range
+        tile = context.scene.tile_forge.tile
+        ps = tile.print_scale
+        relief_min_mm = outdoor.terrain_height_min / ps * 1000
+        relief_max_mm = outdoor.terrain_height_max / ps * 1000
+        base_mm = tile.base_height
+        col.label(text=f"  Relief: {relief_min_mm:.1f} \u2013 {relief_max_mm:.1f} mm (+ {base_mm:.1f} mm base)")
+
         layout.separator()
 
         # Terrain Shaping
         box = layout.box()
         box.label(text="Terrain Shaping", icon='MOD_SMOOTH')
 
-        # Domain warping (hidden for CUSTOM heightmap)
-        if outdoor.terrain_type != "CUSTOM":
+        # Domain warping (hidden for image-based modes)
+        if outdoor.terrain_type not in ("CUSTOM", "MAP_IMAGE"):
             col = box.column(align=True)
             col.prop(outdoor, "enable_domain_warp")
             if outdoor.enable_domain_warp:
@@ -163,7 +235,7 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
 
             box.separator()
 
-            # Terracing (hidden for CUSTOM heightmap)
+            # Terracing (hidden for image-based modes)
             col = box.column(align=True)
             col.prop(outdoor, "enable_terracing")
             if outdoor.enable_terracing:
@@ -180,8 +252,8 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
 
         layout.separator()
 
-        # Noise Layers (hidden for CUSTOM heightmap)
-        if outdoor.terrain_type != "CUSTOM":
+        # Noise Layers (hidden for image-based modes)
+        if outdoor.terrain_type not in ("CUSTOM", "MAP_IMAGE"):
             box = layout.box()
             box.label(text="Noise Layers", icon='NODETREE')
 

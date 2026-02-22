@@ -51,7 +51,7 @@ All Blender-registered classes use the `TILEFORGE_` prefix:
 - Internal calculations use Blender units (meters)
 - `mm()` helper in `mesh_gen.py` converts millimeters to Blender units (divides by 1000)
 - STL export applies 1000x scale factor to convert back to millimeters for 3D printing slicers
-- Grid squares are 25mm (1 inch, standard tabletop scale)
+- Grid square size depends on tile size, print scale, and `grid_squares` setting (default 4 squares across a 6m tile at 1:60 = 25mm)
 - Grid line engravings are 0.4–0.6mm deep
 
 ## Key Technical Details

@@ -28,6 +28,9 @@ class TILEFORGE_OT_GenerateTerrain(Operator):
         outdoor = tf.outdoor
         print_scale = tile.print_scale
 
+        wm = context.window_manager
+        wm.progress_begin(0, 10)
+
         # Clean up previous preview
         _remove_objects_by_prefix("TF_Preview")
 
@@ -46,17 +49,22 @@ class TILEFORGE_OT_GenerateTerrain(Operator):
         context.collection.objects.link(obj)
         context.view_layer.objects.active = obj
         obj.select_set(True)
+        wm.progress_update(1)
 
         # Apply terrain
-        is_procedural = outdoor.terrain_type != "CUSTOM"
-        if not is_procedural and outdoor.heightmap_image:
+        if outdoor.terrain_type == "CUSTOM" and outdoor.heightmap_image:
             mesh_gen.apply_heightmap(obj, outdoor.heightmap_image, outdoor, tile)
+        elif outdoor.terrain_type == "MAP_IMAGE" and outdoor.heightmap_image:
+            mesh_gen.apply_color_map(obj, outdoor.heightmap_image, outdoor, tile)
         else:
             mesh_gen.apply_procedural_noise(obj, outdoor, tile)
+        wm.progress_update(2)
 
-        # Noise layers (procedural only)
-        if is_procedural and outdoor.enable_noise_layers:
+        # Noise layers (procedural modes only)
+        is_image_mode = outdoor.terrain_type in ("CUSTOM", "MAP_IMAGE")
+        if not is_image_mode and outdoor.enable_noise_layers:
             mesh_gen.apply_noise_layers(obj, outdoor, tile)
+        wm.progress_update(3)
 
         # Erosion (operates on height grid for performance)
         if outdoor.enable_hydraulic_erosion or outdoor.enable_thermal_erosion:
@@ -80,33 +88,44 @@ class TILEFORGE_OT_GenerateTerrain(Operator):
             bm.to_mesh(mesh_data)
             bm.free()
             mesh_data.update()
+        wm.progress_update(4)
 
         # Slope clamping (final safety pass — after erosion)
         if outdoor.enable_slope_clamp:
             mesh_gen.clamp_slopes(obj, outdoor.max_slope_angle)
+        wm.progress_update(5)
 
         # River channel (after erosion/clamping — intentional carving)
         if outdoor.add_river and outdoor.river_curve is None:
             self.report({'WARNING'}, "River enabled but no curve assigned — skipping")
         mesh_gen.apply_river_channel(obj, outdoor, tile)
+        wm.progress_update(6)
 
         # Path / road (after erosion — flattens to average height)
         if outdoor.add_path and outdoor.path_curve is None:
             self.report({'WARNING'}, "Path enabled but no curve assigned — skipping")
         mesh_gen.apply_path(obj, outdoor, tile)
+        wm.progress_update(7)
 
         # Ground texture (last detail pass — micro-displacement)
         if outdoor.floor_texture != 'NONE':
             mesh_gen.apply_ground_texture(
                 obj, outdoor.floor_texture, outdoor.texture_strength, tile
             )
+        wm.progress_update(8)
 
         # Add solid base
         mesh_gen.add_solid_base(obj, tile.base_height)
+        wm.progress_update(9)
+
+        # Smooth shading for higher quality terrain surface
+        mesh_gen.apply_shade_smooth(obj)
 
         # Assign terrain material
         mesh_gen.assign_terrain_material(obj)
+        wm.progress_update(10)
 
+        wm.progress_end()
         self.report({'INFO'}, f"Generated terrain: {total_x:.1f} x {total_y:.1f} m")
         return {'FINISHED'}
 
@@ -225,6 +244,10 @@ class TILEFORGE_OT_SliceTiles(Operator):
         tile.map_tiles_x = cols
         tile.map_tiles_y = rows
 
+        wm = context.window_manager
+        total_tiles = rows * cols
+        wm.progress_begin(0, total_tiles)
+
         tile_count = 0
         for row in range(rows):
             for col in range(cols):
@@ -239,6 +262,7 @@ class TILEFORGE_OT_SliceTiles(Operator):
                 mesh_gen.engrave_grid_lines(tile_obj, tile)
 
                 tile_count += 1
+                wm.progress_update(tile_count)
 
         # Arrange tiles in a grid for viewport display
         spacing = m(tile.tile_size_x, print_scale) * 1.2
@@ -256,6 +280,7 @@ class TILEFORGE_OT_SliceTiles(Operator):
         # Optionally hide the preview
         preview_obj.hide_set(True)
 
+        wm.progress_end()
         self.report({'INFO'}, f"Sliced into {tile_count} tiles")
         return {'FINISHED'}
 
@@ -308,6 +333,9 @@ class TILEFORGE_OT_ExportTiles(Operator):
             self.report({'ERROR'}, "No tiles found. Slice terrain first.")
             return {'CANCELLED'}
 
+        wm = context.window_manager
+        wm.progress_begin(0, len(tile_objects))
+
         exported = 0
         warnings = []
 
@@ -329,14 +357,16 @@ class TILEFORGE_OT_ExportTiles(Operator):
             filename = f"{export.filename_prefix}_{obj.name}.stl"
             filepath = os.path.join(export_path, filename)
 
-            bpy.ops.export_mesh.stl(
+            bpy.ops.wm.stl_export(
                 filepath=filepath,
-                use_selection=True,
-                use_mesh_modifiers=True,
+                export_selected_objects=True,
                 global_scale=1000.0,  # Blender meters -> mm for slicers
-                ascii=False,
+                ascii_format=False,
             )
             exported += 1
+            wm.progress_update(exported)
+
+        wm.progress_end()
 
         # Report results
         if warnings:
@@ -376,12 +406,11 @@ class TILEFORGE_OT_ExportSingleTile(Operator):
         filename = f"{export.filename_prefix}_{obj.name}.stl"
         filepath = os.path.join(export_path, filename)
 
-        bpy.ops.export_mesh.stl(
+        bpy.ops.wm.stl_export(
             filepath=filepath,
-            use_selection=True,
-            use_mesh_modifiers=True,
+            export_selected_objects=True,
             global_scale=1000.0,
-            ascii=False,
+            ascii_format=False,
         )
 
         self.report({'INFO'}, f"Exported: {filename}")
@@ -424,6 +453,60 @@ class TILEFORGE_OT_RemoveNoiseLayer(Operator):
             return {'CANCELLED'}
         outdoor.noise_layers.remove(idx)
         outdoor.active_noise_layer_index = min(idx, len(outdoor.noise_layers) - 1)
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Color zone management
+# ---------------------------------------------------------------------------
+
+class TILEFORGE_OT_AddColorZone(Operator):
+    """Add a color zone to the color map terrain"""
+    bl_idname = "tileforge.add_color_zone"
+    bl_label = "Add Color Zone"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+        if len(outdoor.color_zones) >= 8:
+            self.report({'WARNING'}, "Maximum 8 color zones allowed")
+            return {'CANCELLED'}
+
+        # Auto-populate defaults on first add
+        if len(outdoor.color_zones) == 0:
+            defaults = [
+                ("Water",    (0.55, 0.75, 0.80), 0.35, 0.0),
+                ("Lowland",  (0.45, 0.60, 0.35), 0.30, 0.35),
+                ("Highland", (0.50, 0.40, 0.30), 0.30, 0.80),
+            ]
+            for name, color, tol, height in defaults:
+                zone = outdoor.color_zones.add()
+                zone.zone_name = name
+                zone.color = color
+                zone.tolerance = tol
+                zone.height = height
+        else:
+            zone = outdoor.color_zones.add()
+            zone.zone_name = f"Zone {len(outdoor.color_zones)}"
+
+        outdoor.active_color_zone_index = len(outdoor.color_zones) - 1
+        return {'FINISHED'}
+
+
+class TILEFORGE_OT_RemoveColorZone(Operator):
+    """Remove the active color zone"""
+    bl_idname = "tileforge.remove_color_zone"
+    bl_label = "Remove Color Zone"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+        idx = outdoor.active_color_zone_index
+        if idx < 0 or idx >= len(outdoor.color_zones):
+            self.report({'WARNING'}, "No color zone selected")
+            return {'CANCELLED'}
+        outdoor.color_zones.remove(idx)
+        outdoor.active_color_zone_index = min(idx, len(outdoor.color_zones) - 1)
         return {'FINISHED'}
 
 
@@ -472,6 +555,8 @@ _classes = (
     TILEFORGE_OT_ExportSingleTile,
     TILEFORGE_OT_AddNoiseLayer,
     TILEFORGE_OT_RemoveNoiseLayer,
+    TILEFORGE_OT_AddColorZone,
+    TILEFORGE_OT_RemoveColorZone,
     TILEFORGE_OT_CleanupAll,
 )
 

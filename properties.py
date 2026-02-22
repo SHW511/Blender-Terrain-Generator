@@ -13,6 +13,7 @@ from bpy.props import (
     CollectionProperty,
     EnumProperty,
     FloatProperty,
+    FloatVectorProperty,
     IntProperty,
     PointerProperty,
     StringProperty,
@@ -35,6 +36,7 @@ TERRAIN_TYPES = [
     ("DESERT", "Desert Dunes", "Smooth rolling dune shapes"),
     ("FOREST", "Forest Floor", "Organic bumpy forest ground"),
     ("CUSTOM", "Custom Heightmap", "Load a grayscale image as heightmap"),
+    ("MAP_IMAGE", "Color Map", "Derive terrain from an illustrated color map image"),
 ]
 
 NOISE_TYPES = [
@@ -133,14 +135,14 @@ class TILEFORGE_PG_TileSettings(PropertyGroup):
     )
     grid_squares: IntProperty(
         name="Grid Squares per Tile",
-        description="Number of 5-foot (1.5m) squares along one tile edge",
+        description="Number of grid squares along the tile width",
         default=4,
         min=1,
         max=12,
     )
     engrave_grid: BoolProperty(
         name="Engrave Grid Lines",
-        description="Cut 5-foot (1.5m) grid lines into the tile surface",
+        description="Cut grid lines into the tile surface",
         default=True,
     )
     grid_line_depth: FloatProperty(
@@ -331,6 +333,34 @@ def _update_hydraulic_preset(self, context):
         self.hydraulic_radius = vals[7]
 
 
+class TILEFORGE_PG_ColorZone(PropertyGroup):
+    """A single color-to-height mapping zone for color map terrain."""
+
+    zone_name: StringProperty(
+        name="Name",
+        default="Zone",
+    )
+    color: FloatVectorProperty(
+        name="Color",
+        subtype='COLOR',
+        size=3,
+        default=(0.0, 0.0, 1.0),
+        min=0.0, max=1.0,
+    )
+    tolerance: FloatProperty(
+        name="Tolerance",
+        description="How far from this color to still match (HSV distance)",
+        default=0.3,
+        min=0.05, max=1.0,
+    )
+    height: FloatProperty(
+        name="Height",
+        description="Normalized target height (0=lowest, 1=highest)",
+        default=0.0,
+        min=0.0, max=1.0,
+    )
+
+
 class TILEFORGE_PG_OutdoorSettings(PropertyGroup):
     """Settings for outdoor terrain generation."""
 
@@ -354,6 +384,57 @@ class TILEFORGE_PG_OutdoorSettings(PropertyGroup):
         name="Heightmap Image",
         description="Path to grayscale heightmap image",
         subtype='FILE_PATH',
+    )
+
+    # Crop margins (used by CUSTOM and MAP_IMAGE modes)
+    crop_top: FloatProperty(
+        name="Crop Top",
+        description="Percentage of image to crop from the top edge",
+        default=0.0,
+        min=0.0, max=50.0,
+        subtype='PERCENTAGE',
+    )
+    crop_bottom: FloatProperty(
+        name="Crop Bottom",
+        description="Percentage of image to crop from the bottom edge",
+        default=0.0,
+        min=0.0, max=50.0,
+        subtype='PERCENTAGE',
+    )
+    crop_left: FloatProperty(
+        name="Crop Left",
+        description="Percentage of image to crop from the left edge",
+        default=0.0,
+        min=0.0, max=50.0,
+        subtype='PERCENTAGE',
+    )
+    crop_right: FloatProperty(
+        name="Crop Right",
+        description="Percentage of image to crop from the right edge",
+        default=0.0,
+        min=0.0, max=50.0,
+        subtype='PERCENTAGE',
+    )
+
+    # Color map settings (MAP_IMAGE mode)
+    color_zones: CollectionProperty(type=TILEFORGE_PG_ColorZone)
+    active_color_zone_index: IntProperty(
+        name="Active Zone",
+        default=0,
+    )
+    map_smoothing: IntProperty(
+        name="Smoothing Iterations",
+        description="Laplacian blur iterations for natural transitions between zones",
+        default=10,
+        min=0, max=50,
+    )
+    fallback_height: FloatProperty(
+        name="Fallback Height",
+        description="Normalized height for pixels matching no color zone",
+        default=0.5,
+        min=0.0, max=1.0,
+        step=5,
+        precision=2,
     )
 
     # Terrain shape controls
@@ -445,9 +526,9 @@ class TILEFORGE_PG_OutdoorSettings(PropertyGroup):
     subdivisions: IntProperty(
         name="Mesh Subdivisions",
         description="Resolution of the terrain mesh (higher = more detail, slower)",
-        default=64,
+        default=128,
         min=8,
-        max=256,
+        max=512,
     )
 
     # Domain warping
@@ -871,6 +952,7 @@ class TILEFORGE_PG_Main(PropertyGroup):
 _classes = (
     TILEFORGE_PG_TileSettings,
     TILEFORGE_PG_NoiseLayer,
+    TILEFORGE_PG_ColorZone,
     TILEFORGE_PG_OutdoorSettings,
     TILEFORGE_PG_DungeonSettings,
     TILEFORGE_PG_ExportSettings,

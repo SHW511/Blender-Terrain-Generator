@@ -10,6 +10,7 @@ Two unit systems:
 Both convert to Blender units (meters internally).
 """
 
+import colorsys
 import math
 import bmesh
 import bpy
@@ -1190,12 +1191,22 @@ def apply_heightmap(obj, image_path, settings_outdoor, settings_tile):
     height_range = m(settings_outdoor.terrain_height_max - settings_outdoor.terrain_height_min, print_scale)
     height_offset = m(settings_outdoor.terrain_height_min, print_scale)
 
+    # Crop margins (percentages to 0-1 fractions)
+    cl = settings_outdoor.crop_left / 100.0
+    cr = settings_outdoor.crop_right / 100.0
+    ct = settings_outdoor.crop_top / 100.0
+    cb = settings_outdoor.crop_bottom / 100.0
+
     for v in bm.verts:
         # Map vertex XY to image UV (0..1)
-        u = (v.co.x + half_x) / (2.0 * half_x) if half_x > 0 else 0.5
-        v_coord = (v.co.y + half_y) / (2.0 * half_y) if half_y > 0 else 0.5
-        u = max(0.0, min(1.0, u))
-        v_coord = max(0.0, min(1.0, v_coord))
+        u_raw = (v.co.x + half_x) / (2.0 * half_x) if half_x > 0 else 0.5
+        v_raw = (v.co.y + half_y) / (2.0 * half_y) if half_y > 0 else 0.5
+        u_raw = max(0.0, min(1.0, u_raw))
+        v_raw = max(0.0, min(1.0, v_raw))
+
+        # Apply crop offsets
+        u = cl + u_raw * (1.0 - cl - cr)
+        v_coord = cb + v_raw * (1.0 - cb - ct)
 
         # Pixel coordinates
         px = int(u * (w - 1))
@@ -1210,6 +1221,186 @@ def apply_heightmap(obj, image_path, settings_outdoor, settings_tile):
 
     bm.to_mesh(mesh)
     bm.free()
+    mesh.update()
+
+
+# ---------------------------------------------------------------------------
+# Color map terrain
+# ---------------------------------------------------------------------------
+
+def _smooth_z(bm, iterations):
+    """Laplacian smooth on bmesh vertex Z values only.
+
+    Blends each vertex's Z with the average of its neighbors (50/50 mix).
+
+    Args:
+        bm: BMesh to smooth
+        iterations: Number of smoothing passes
+    """
+    for _ in range(iterations):
+        new_z = {}
+        for v in bm.verts:
+            neighbors = [e.other_vert(v) for e in v.link_edges]
+            if neighbors:
+                avg = sum(n.co.z for n in neighbors) / len(neighbors)
+                new_z[v.index] = v.co.z * 0.5 + avg * 0.5
+            else:
+                new_z[v.index] = v.co.z
+        for v in bm.verts:
+            v.co.z = new_z[v.index]
+
+
+def _hsv_distance_sq(h1, s1, v1, h2, s2, v2):
+    """Compute weighted squared HSV distance between two HSV colors.
+
+    Hue is weighted 2x and wraps at 1.0. Returns squared distance
+    for efficient comparison against tolerance thresholds.
+
+    Args:
+        h1, s1, v1: First color in HSV (0-1 range)
+        h2, s2, v2: Second color in HSV (0-1 range)
+
+    Returns:
+        Squared HSV distance (float)
+    """
+    # Hue wraps at 1.0
+    dh = min(abs(h1 - h2), 1.0 - abs(h1 - h2))
+    ds = abs(s1 - s2)
+    dv = abs(v1 - v2)
+    return (dh * 2.0) ** 2 + ds ** 2 + dv ** 2
+
+
+def apply_color_map(obj, image_path, settings_outdoor, settings_tile):
+    """Displace vertices based on color zones from an illustrated map image.
+
+    Each pixel's RGB color is matched against user-defined color zones using
+    HSV distance. The closest matching zone's height is assigned. Pixels
+    matching no zone use the fallback height. Z-only Laplacian smoothing
+    is applied for natural transitions.
+
+    Args:
+        obj: Blender mesh object
+        image_path: Path to color map image file
+        settings_outdoor: TILEFORGE_PG_OutdoorSettings
+        settings_tile: TILEFORGE_PG_TileSettings
+    """
+    # Load image
+    img = bpy.data.images.load(image_path, check_existing=True)
+    pixels = list(img.pixels)  # Flat RGBA array
+    w, h = img.size
+
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+
+    print_scale = settings_tile.print_scale
+    half_x = m(settings_tile.map_width, print_scale) / 2.0
+    half_y = m(settings_tile.map_depth, print_scale) / 2.0
+    height_range = m(settings_outdoor.terrain_height_max - settings_outdoor.terrain_height_min, print_scale)
+    height_offset = m(settings_outdoor.terrain_height_min, print_scale)
+
+    # Crop margins (percentages to 0-1 fractions)
+    cl = settings_outdoor.crop_left / 100.0
+    cr = settings_outdoor.crop_right / 100.0
+    ct = settings_outdoor.crop_top / 100.0
+    cb = settings_outdoor.crop_bottom / 100.0
+
+    # Pre-convert zone colors to HSV tuples for fast access
+    zones = []
+    for zone in settings_outdoor.color_zones:
+        zh, zs, zv = colorsys.rgb_to_hsv(zone.color[0], zone.color[1], zone.color[2])
+        zones.append((
+            zh, zs, zv,
+            zone.tolerance ** 2,  # Store squared tolerance for comparison
+            zone.height,
+        ))
+
+    fallback = settings_outdoor.fallback_height
+
+    for v in bm.verts:
+        # Map vertex XY to image UV (0..1)
+        u_raw = (v.co.x + half_x) / (2.0 * half_x) if half_x > 0 else 0.5
+        v_raw = (v.co.y + half_y) / (2.0 * half_y) if half_y > 0 else 0.5
+        u_raw = max(0.0, min(1.0, u_raw))
+        v_raw = max(0.0, min(1.0, v_raw))
+
+        # Apply crop offsets
+        u = cl + u_raw * (1.0 - cl - cr)
+        v_coord = cb + v_raw * (1.0 - cb - ct)
+
+        # Pixel coordinates
+        px = int(u * (w - 1))
+        py = int(v_coord * (h - 1))
+        idx = (py * w + px) * 4  # RGBA
+
+        # Sample pixel RGB and convert to HSV once per vertex
+        if idx + 2 < len(pixels):
+            pr, pg, pb = pixels[idx], pixels[idx + 1], pixels[idx + 2]
+        else:
+            pr, pg, pb = 0.0, 0.0, 0.0
+        ph, ps, pv = colorsys.rgb_to_hsv(pr, pg, pb)
+
+        # Find closest matching zone
+        best_dist = float('inf')
+        best_height = fallback
+        best_tol_sq = 0.0
+        for zh, zs, zv, tol_sq, z_height in zones:
+            dist = _hsv_distance_sq(ph, ps, pv, zh, zs, zv)
+            if dist < best_dist:
+                best_dist = dist
+                best_height = z_height
+                best_tol_sq = tol_sq
+
+        # If best match exceeds its tolerance, use fallback
+        if best_dist > best_tol_sq:
+            best_height = fallback
+
+        v.co.z = height_offset + best_height * height_range
+
+    # Apply Z-only Laplacian smoothing
+    if settings_outdoor.map_smoothing > 0:
+        _smooth_z(bm, settings_outdoor.map_smoothing)
+
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+
+# ---------------------------------------------------------------------------
+# Shade smooth
+# ---------------------------------------------------------------------------
+
+def apply_shade_smooth(obj):
+    """Apply smooth shading to terrain faces for higher quality surface.
+
+    Only smooths faces whose normal points mostly upward (terrain surface).
+    Side walls and bottom stay flat-shaded for clean print edges.
+
+    Args:
+        obj: Blender mesh object
+    """
+    mesh = obj.data
+    mesh.shade_smooth()
+
+    # Use auto-smooth so that sharp edges (side walls, base) stay crisp
+    # while the terrain surface gets interpolated normals
+    if not mesh.has_custom_normals:
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        # Mark edges with a sharp angle change (side walls, base perimeter)
+        for edge in bm.edges:
+            if len(edge.link_faces) == 2:
+                angle = edge.calc_face_angle(0.0)
+                # Edges steeper than 60 degrees stay sharp
+                if angle > math.radians(60):
+                    edge.smooth = False
+                else:
+                    edge.smooth = True
+            else:
+                edge.smooth = False
+        bm.to_mesh(mesh)
+        bm.free()
+
     mesh.update()
 
 
@@ -1245,7 +1436,8 @@ def assign_terrain_material(obj):
 def add_solid_base(obj, base_height_mm):
     """
     Extrude the terrain mesh downward to create a solid base.
-    This creates a watertight printable volume.
+    Duplicates the entire top surface at bottom_z with reversed winding,
+    then connects the perimeter with side walls for a fully watertight volume.
 
     Args:
         obj: Blender mesh object with terrain on Z
@@ -1259,71 +1451,55 @@ def add_solid_base(obj, base_height_mm):
     bm.edges.ensure_lookup_table()
     bm.verts.ensure_lookup_table()
 
-    # Find the boundary edges (edges with only one face)
+    # Snapshot original geometry before modifying
+    original_verts = list(bm.verts)
+    original_faces = list(bm.faces)
     boundary_edges = [e for e in bm.edges if e.is_boundary]
 
     # Find minimum Z to know where bottom should be
-    min_z = min(v.co.z for v in bm.verts)
+    min_z = min(v.co.z for v in original_verts)
     bottom_z = min_z - mm(base_height_mm)
 
-    # Collect boundary verts
-    boundary_verts = set()
-    for e in boundary_edges:
-        for v in e.verts:
-            boundary_verts.add(v)
-
-    # Duplicate boundary verts at bottom Z
+    # Duplicate ALL verts at bottom Z (not just boundary)
     vert_map = {}
-    for v in boundary_verts:
+    for v in original_verts:
         new_v = bm.verts.new((v.co.x, v.co.y, bottom_z))
         vert_map[v] = new_v
 
     bm.verts.ensure_lookup_table()
 
-    # Create side faces connecting top boundary to bottom boundary
+    # Create bottom faces — mirror every top face with reversed winding
+    for face in original_faces:
+        bottom_face_verts = [vert_map[v] for v in reversed(face.verts)]
+        try:
+            bm.faces.new(bottom_face_verts)
+        except ValueError:
+            pass
+
+    # Create side walls from boundary edges with correct outward winding.
+    # A boundary edge has exactly one adjacent face. We check the vertex
+    # order in that face to determine which winding produces an outward normal.
     for e in boundary_edges:
         v1, v2 = e.verts
-        if v1 in vert_map and v2 in vert_map:
-            b1 = vert_map[v1]
-            b2 = vert_map[v2]
-            # Create quad face (winding order matters for normals)
-            try:
-                bm.faces.new([v1, v2, b2, b1])
-            except ValueError:
-                # Face might already exist
-                pass
+        b1 = vert_map[v1]
+        b2 = vert_map[v2]
 
-    # Create bottom face
-    bottom_verts_ordered = []
-    if boundary_edges:
-        # Walk the boundary loop to get ordered verts
-        visited = set()
-        start_edge = boundary_edges[0]
-        current_vert = start_edge.verts[0]
-        bottom_verts_ordered.append(vert_map[current_vert])
-        visited.add(current_vert)
+        face = e.link_faces[0]
+        face_verts = list(face.verts)
+        i1 = face_verts.index(v1)
+        # If v1→v2 follows the face's CCW winding, the outward side wall
+        # must go in the opposite direction: v2→v1 at top, b1→b2 at bottom.
+        if face_verts[(i1 + 1) % len(face_verts)] == v2:
+            quad = [v2, v1, b1, b2]
+        else:
+            quad = [v1, v2, b2, b1]
+        try:
+            bm.faces.new(quad)
+        except ValueError:
+            pass
 
-        for _ in range(len(boundary_verts)):
-            found_next = False
-            for e in current_vert.link_edges:
-                if e.is_boundary and e != start_edge:
-                    other = e.other_vert(current_vert)
-                    if other not in visited:
-                        visited.add(other)
-                        bottom_verts_ordered.append(vert_map[other])
-                        start_edge = e
-                        current_vert = other
-                        found_next = True
-                        break
-            if not found_next:
-                break
-
-        if len(bottom_verts_ordered) >= 3:
-            try:
-                # Reverse for correct normal direction (pointing down)
-                bm.faces.new(list(reversed(bottom_verts_ordered)))
-            except ValueError:
-                pass
+    # Final safety pass — recalculate normals to ensure consistency
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
 
     bm.to_mesh(mesh)
     bm.free()
@@ -1336,11 +1512,14 @@ def add_solid_base(obj, base_height_mm):
 
 def engrave_grid_lines(obj, settings_tile):
     """
-    Cut grid lines into the top surface of the tile using boolean operations.
-    Creates thin box cutters at 5-foot (1.524m world) intervals and subtracts them.
+    Engrave grid lines into the top surface of a tile by bisecting the mesh
+    at groove boundaries and displacing surface vertices downward.
+
+    This follows the terrain contour at any height, unlike a flat boolean
+    cutter which only intersects near the peak.
 
     Args:
-        obj: The tile mesh object
+        obj: The tile mesh object (already sliced, centered at origin)
         settings_tile: TILEFORGE_PG_TileSettings
     """
     if not settings_tile.engrave_grid:
@@ -1349,101 +1528,75 @@ def engrave_grid_lines(obj, settings_tile):
     print_scale = settings_tile.print_scale
     tile_x = m(settings_tile.tile_size_x, print_scale)
     tile_y = m(settings_tile.tile_size_y, print_scale)
-    grid_spacing = m(1.524, print_scale)  # 5 feet = 1.524m world
-    line_width = mm(settings_tile.grid_line_width)
+    grid_squares = settings_tile.grid_squares
+    grid_spacing_x = tile_x / grid_squares
+    # Keep Y cells as square as possible
+    grid_squares_y = max(1, round(settings_tile.tile_size_y / (settings_tile.tile_size_x / grid_squares)))
+    grid_spacing_y = tile_y / grid_squares_y
+    half_w = mm(settings_tile.grid_line_width) / 2.0
     line_depth = mm(settings_tile.grid_line_depth)
 
-    cutters = []
-
-    # Vertical lines (along Y axis)
-    num_lines_x = int(settings_tile.tile_size_x / 1.524) + 1
-    for i in range(num_lines_x + 1):
-        x = -tile_x / 2.0 + i * grid_spacing
-        if x < -tile_x / 2.0 - 0.0001 or x > tile_x / 2.0 + 0.0001:
-            continue
-        cutter = _create_line_cutter(
-            f"grid_v_{i}",
-            center=(x, 0.0),
-            length=tile_y + mm(1.0),  # Overshoot slightly
-            width=line_width,
-            depth=line_depth,
-            vertical=True,
-        )
-        cutters.append(cutter)
-
-    # Horizontal lines (along X axis)
-    num_lines_y = int(settings_tile.tile_size_y / 1.524) + 1
-    for i in range(num_lines_y + 1):
-        y = -tile_y / 2.0 + i * grid_spacing
-        if y < -tile_y / 2.0 - 0.0001 or y > tile_y / 2.0 + 0.0001:
-            continue
-        cutter = _create_line_cutter(
-            f"grid_h_{i}",
-            center=(0.0, y),
-            length=tile_x + mm(1.0),
-            width=line_width,
-            depth=line_depth,
-            vertical=False,
-        )
-        cutters.append(cutter)
-
-    # Apply boolean difference for each cutter
-    for cutter in cutters:
-        # Link cutter to scene temporarily
-        bpy.context.collection.objects.link(cutter)
-
-        mod = obj.modifiers.new(name="GridEngrave", type='BOOLEAN')
-        mod.operation = 'DIFFERENCE'
-        mod.object = cutter
-        mod.solver = 'FAST'
-
-        # Apply modifier
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.modifier_apply(modifier=mod.name)
-
-        # Remove cutter
-        bpy.data.objects.remove(cutter, do_unlink=True)
-
-
-def _create_line_cutter(name, center, length, width, depth, vertical):
-    """Create a thin box mesh for boolean cutting a grid line."""
-    mesh = bpy.data.meshes.new(f"{name}_mesh")
-    obj = bpy.data.objects.new(name, mesh)
-
+    mesh_data = obj.data
     bm = bmesh.new()
+    bm.from_mesh(mesh_data)
 
-    if vertical:
-        sx, sy = width / 2.0, length / 2.0
-    else:
-        sx, sy = length / 2.0, width / 2.0
+    # --- Bisect at every groove edge to create precise boundaries ----------
+    # Vertical grid lines (cuts perpendicular to X)
+    for i in range(grid_squares + 1):
+        x = -tile_x / 2.0 + i * grid_spacing_x
+        for offset in (-half_w, half_w):
+            geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+            bmesh.ops.bisect_plane(
+                bm, geom=geom,
+                plane_co=(x + offset, 0.0, 0.0),
+                plane_no=(1.0, 0.0, 0.0),
+            )
 
-    # Find max Z of the target (approximate: place cutter high)
-    top_z = mm(50.0)
-    bot_z = top_z - depth
+    # Horizontal grid lines (cuts perpendicular to Y)
+    for i in range(grid_squares_y + 1):
+        y = -tile_y / 2.0 + i * grid_spacing_y
+        for offset in (-half_w, half_w):
+            geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+            bmesh.ops.bisect_plane(
+                bm, geom=geom,
+                plane_co=(0.0, y + offset, 0.0),
+                plane_no=(0.0, 1.0, 0.0),
+            )
 
-    verts = [
-        bm.verts.new((center[0] - sx, center[1] - sy, bot_z)),
-        bm.verts.new((center[0] + sx, center[1] - sy, bot_z)),
-        bm.verts.new((center[0] + sx, center[1] + sy, bot_z)),
-        bm.verts.new((center[0] - sx, center[1] + sy, bot_z)),
-        bm.verts.new((center[0] - sx, center[1] - sy, top_z)),
-        bm.verts.new((center[0] + sx, center[1] - sy, top_z)),
-        bm.verts.new((center[0] + sx, center[1] + sy, top_z)),
-        bm.verts.new((center[0] - sx, center[1] + sy, top_z)),
-    ]
+    bm.verts.ensure_lookup_table()
 
-    # Create faces
-    bm.faces.new([verts[0], verts[1], verts[2], verts[3]])  # bottom
-    bm.faces.new([verts[7], verts[6], verts[5], verts[4]])  # top
-    bm.faces.new([verts[0], verts[4], verts[5], verts[1]])  # front
-    bm.faces.new([verts[2], verts[6], verts[7], verts[3]])  # back
-    bm.faces.new([verts[0], verts[3], verts[7], verts[4]])  # left
-    bm.faces.new([verts[1], verts[5], verts[6], verts[2]])  # right
+    # --- Displace surface vertices inside groove strips --------------------
+    # Base vertices sit at the mesh minimum Z; skip them.
+    min_z = min(v.co.z for v in bm.verts)
+    base_threshold = min_z + mm(0.1)
 
-    bm.to_mesh(mesh)
+    # Pre-compute grid line center positions
+    x_lines = [-tile_x / 2.0 + i * grid_spacing_x for i in range(grid_squares + 1)]
+    y_lines = [-tile_y / 2.0 + i * grid_spacing_y for i in range(grid_squares_y + 1)]
+
+    eps = half_w + 1e-7  # small tolerance for bisect precision
+
+    for v in bm.verts:
+        if v.co.z <= base_threshold:
+            continue
+
+        in_groove = False
+        for lx in x_lines:
+            if abs(v.co.x - lx) <= eps:
+                in_groove = True
+                break
+        if not in_groove:
+            for ly in y_lines:
+                if abs(v.co.y - ly) <= eps:
+                    in_groove = True
+                    break
+
+        if in_groove:
+            v.co.z -= line_depth
+
+    bm.to_mesh(mesh_data)
     bm.free()
-
-    return obj
+    mesh_data.update()
 
 
 # ---------------------------------------------------------------------------
@@ -1537,7 +1690,8 @@ def _add_peg(obj, position_xy, radius, height, axis='X'):
     peg_obj = bpy.data.objects.new("peg_temp", peg_mesh)
     bpy.context.collection.objects.link(peg_obj)
 
-    # Join with main object
+    # Join with main object (deselect all first to avoid absorbing other tiles)
+    bpy.ops.object.select_all(action='DESELECT')
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
     peg_obj.select_set(True)
@@ -1580,7 +1734,7 @@ def _add_slot(obj, position_xy, radius, depth, axis='X'):
     mod = obj.modifiers.new(name="SlotCut", type='BOOLEAN')
     mod.operation = 'DIFFERENCE'
     mod.object = slot_obj
-    mod.solver = 'FAST'
+    mod.solver = 'EXACT'
 
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.modifier_apply(modifier=mod.name)
@@ -1709,12 +1863,20 @@ def slice_terrain_to_tile(source_obj, settings_tile, tile_col, tile_row):
     bm = bmesh.new()
     bmesh.ops.create_cube(bm, size=1.0)
 
-    # Scale and position
-    height = mm(100.0)  # Tall enough to cut through everything (physical)
+    # Scale and position — derive cutter height from actual mesh extents
+    src_verts = source_obj.data.vertices
+    min_z = min(v.co.z for v in src_verts)
+    max_z = max(v.co.z for v in src_verts)
+    margin = max(max_z - min_z, mm(100.0)) * 0.1  # 10% margin
+    cutter_min_z = min_z - margin
+    cutter_max_z = max_z + margin
+    cutter_mid_z = (cutter_min_z + cutter_max_z) / 2.0
+    cutter_height = cutter_max_z - cutter_min_z
+
     for v in bm.verts:
         v.co.x = center_x + v.co.x * tile_x
         v.co.y = center_y + v.co.y * tile_y
-        v.co.z = v.co.z * height
+        v.co.z = cutter_mid_z + v.co.z * cutter_height
 
     bm.to_mesh(cutter_mesh)
     bm.free()
@@ -1731,7 +1893,7 @@ def slice_terrain_to_tile(source_obj, settings_tile, tile_col, tile_row):
     mod = tile_obj.modifiers.new(name="TileSlice", type='BOOLEAN')
     mod.operation = 'INTERSECT'
     mod.object = cutter_obj
-    mod.solver = 'FAST'
+    mod.solver = 'EXACT'
 
     bpy.context.view_layer.objects.active = tile_obj
     bpy.ops.object.modifier_apply(modifier=mod.name)
@@ -1739,9 +1901,17 @@ def slice_terrain_to_tile(source_obj, settings_tile, tile_col, tile_row):
     # Cleanup cutter
     bpy.data.objects.remove(cutter_obj, do_unlink=True)
 
-    # Re-center tile at origin for individual export
-    tile_obj.location.x -= center_x
-    tile_obj.location.y -= center_y
+    # Re-center mesh data at origin (not just object location)
+    # so that connectors and grid engraving align correctly
+    tile_mesh = tile_obj.data
+    bm = bmesh.new()
+    bm.from_mesh(tile_mesh)
+    for v in bm.verts:
+        v.co.x -= center_x
+        v.co.y -= center_y
+    bm.to_mesh(tile_mesh)
+    bm.free()
+    tile_mesh.update()
 
     return tile_obj
 
