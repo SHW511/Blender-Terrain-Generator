@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "dnd_tile_forge"
+version = "0.1.0"
+name = "D&D Tile Forge"
+tagline = "Generate 3D-printable modular terrain tiles for tabletop RPGs"
+maintainer = "Zerg"
+type = "add-on"
+
+blender_version_min = "5.0.0"
+
+license = [
+    "SPDX:GPL-3.0-or-later"
+]
+
+tags = [
+    "3D View",
+    "Mesh",
+]
+
+# We need file system access for STL export
+[permissions]
+files = "Export STL tile files to disk"
