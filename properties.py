@@ -90,6 +90,29 @@ HYDRAULIC_PRESETS = [
     ("HEAVY", "Heavy", "Aggressive carving — deep gorges"),
 ]
 
+GRID_PRESETS = [
+    ("CUSTOM", "Custom", "Manually set grid squares per tile"),
+    ("1_INCH", "1 Inch (25.4mm)", "Standard 1-inch tabletop grid — 5ft at 28mm scale"),
+    ("25MM", "25mm", "Metric 25mm grid"),
+]
+
+_GRID_PRESET_MM = {"1_INCH": 25.4, "25MM": 25.0}
+
+
+def _update_grid_preset(self, context):
+    """Snap tile sizes so each grid square is exactly the preset size."""
+    if self.grid_preset == "CUSTOM":
+        return
+    sq_mm = _GRID_PRESET_MM[self.grid_preset]
+    ps = self.print_scale
+    # Best-fit grid squares for current tile dimensions
+    gs_x = max(1, round(self.tile_size_x * 1000 / ps / sq_mm))
+    gs_y = max(1, round(self.tile_size_y * 1000 / ps / sq_mm))
+    # Snap tile sizes to exact multiples of the grid square
+    self.grid_squares = gs_x
+    self.tile_size_x = max(1.5, min(18.0, round(gs_x * sq_mm * ps / 1000, 4)))
+    self.tile_size_y = max(1.5, min(18.0, round(gs_y * sq_mm * ps / 1000, 4)))
+
 
 # ---------------------------------------------------------------------------
 # Property Groups
@@ -132,6 +155,13 @@ class TILEFORGE_PG_TileSettings(PropertyGroup):
         max=10.0,
         step=50,
         precision=1,
+    )
+    grid_preset: EnumProperty(
+        name="Grid Size Preset",
+        description="Preset grid square size — snaps tile dimensions for exact fit",
+        items=GRID_PRESETS,
+        default="CUSTOM",
+        update=_update_grid_preset,
     )
     grid_squares: IntProperty(
         name="Grid Squares per Tile",

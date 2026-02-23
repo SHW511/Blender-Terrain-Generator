@@ -82,7 +82,9 @@ class TILEFORGE_PT_TileSettings(TILEFORGE_PT_Base, Panel):
         col = layout.column(align=True)
         col.prop(tile, "engrave_grid")
         if tile.engrave_grid:
-            col.prop(tile, "grid_squares")
+            col.prop(tile, "grid_preset")
+            if tile.grid_preset == 'CUSTOM':
+                col.prop(tile, "grid_squares")
             col.prop(tile, "grid_line_depth")
             col.prop(tile, "grid_line_width")
 
@@ -92,10 +94,17 @@ class TILEFORGE_PT_TileSettings(TILEFORGE_PT_Base, Panel):
         ps = tile.print_scale
         tile_mm_x = tile.tile_size_x / ps * 1000
         tile_mm_y = tile.tile_size_y / ps * 1000
-        grid_sq = tile.grid_squares
-        grid_mm_x = tile_mm_x / grid_sq
-        grid_sq_y = max(1, round(tile.tile_size_y / (tile.tile_size_x / grid_sq)))
-        grid_mm_y = tile_mm_y / grid_sq_y
+
+        _preset_sizes = {"1_INCH": 25.4, "25MM": 25.0}
+        if tile.grid_preset in _preset_sizes:
+            grid_mm_x = _preset_sizes[tile.grid_preset]
+            grid_mm_y = grid_mm_x
+        else:
+            grid_sq = tile.grid_squares
+            grid_mm_x = tile_mm_x / grid_sq
+            grid_sq_y = max(1, round(tile.tile_size_y / (tile.tile_size_x / grid_sq)))
+            grid_mm_y = tile_mm_y / grid_sq_y
+
         map_mm_x = tile.map_width / ps * 1000
         map_mm_y = tile.map_depth / ps * 1000
 

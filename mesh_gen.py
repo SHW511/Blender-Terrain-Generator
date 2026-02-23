@@ -1528,11 +1528,20 @@ def engrave_grid_lines(obj, settings_tile):
     print_scale = settings_tile.print_scale
     tile_x = m(settings_tile.tile_size_x, print_scale)
     tile_y = m(settings_tile.tile_size_y, print_scale)
-    grid_squares = settings_tile.grid_squares
-    grid_spacing_x = tile_x / grid_squares
-    # Keep Y cells as square as possible
-    grid_squares_y = max(1, round(settings_tile.tile_size_y / (settings_tile.tile_size_x / grid_squares)))
-    grid_spacing_y = tile_y / grid_squares_y
+
+    _preset_sizes = {"1_INCH": 25.4, "25MM": 25.0}
+    if settings_tile.grid_preset in _preset_sizes:
+        # Fixed physical grid — always exactly the preset size on the print
+        grid_spacing_x = mm(_preset_sizes[settings_tile.grid_preset])
+        grid_spacing_y = grid_spacing_x
+        grid_squares = max(1, int(tile_x / grid_spacing_x))
+        grid_squares_y = max(1, int(tile_y / grid_spacing_y))
+    else:
+        grid_squares = settings_tile.grid_squares
+        grid_spacing_x = tile_x / grid_squares
+        # Keep Y cells as square as possible
+        grid_squares_y = max(1, round(settings_tile.tile_size_y / (settings_tile.tile_size_x / grid_squares)))
+        grid_spacing_y = tile_y / grid_squares_y
     half_w = mm(settings_tile.grid_line_width) / 2.0
     line_depth = mm(settings_tile.grid_line_depth)
 
