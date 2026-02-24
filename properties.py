@@ -90,6 +90,29 @@ HYDRAULIC_PRESETS = [
     ("HEAVY", "Heavy", "Aggressive carving — deep gorges"),
 ]
 
+GRID_PRESETS = [
+    ("CUSTOM", "Custom", "Manually set grid squares per tile"),
+    ("1_INCH", "1 Inch (25.4mm)", "Standard 1-inch tabletop grid — 5ft at 28mm scale"),
+    ("25MM", "25mm", "Metric 25mm grid"),
+]
+
+_GRID_PRESET_MM = {"1_INCH": 25.4, "25MM": 25.0}
+
+
+def _update_grid_preset(self, context):
+    """Snap tile sizes so each grid square is exactly the preset size."""
+    if self.grid_preset == "CUSTOM":
+        return
+    sq_mm = _GRID_PRESET_MM[self.grid_preset]
+    ps = self.print_scale
+    # Best-fit grid squares for current tile dimensions
+    gs_x = max(1, round(self.tile_size_x * 1000 / ps / sq_mm))
+    gs_y = max(1, round(self.tile_size_y * 1000 / ps / sq_mm))
+    # Snap tile sizes to exact multiples of the grid square
+    self.grid_squares = gs_x
+    self.tile_size_x = max(1.5, min(18.0, round(gs_x * sq_mm * ps / 1000, 4)))
+    self.tile_size_y = max(1.5, min(18.0, round(gs_y * sq_mm * ps / 1000, 4)))
+
 
 # ---------------------------------------------------------------------------
 # Property Groups
@@ -132,6 +155,13 @@ class TILEFORGE_PG_TileSettings(PropertyGroup):
         max=10.0,
         step=50,
         precision=1,
+    )
+    grid_preset: EnumProperty(
+        name="Grid Size Preset",
+        description="Preset grid square size — snaps tile dimensions for exact fit",
+        items=GRID_PRESETS,
+        default="CUSTOM",
+        update=_update_grid_preset,
     )
     grid_squares: IntProperty(
         name="Grid Squares per Tile",
@@ -314,6 +344,16 @@ class TILEFORGE_PG_NoiseLayer(PropertyGroup):
     )
 
 
+def _update_paint_opacity(self, context):
+    """Update the paint overlay opacity in the material node tree."""
+    mat = bpy.data.materials.get("TF_Paint_Material")
+    if not mat or not mat.node_tree:
+        return
+    node = mat.node_tree.nodes.get("TF_OpacityMult")
+    if node:
+        node.inputs[1].default_value = self.paint_overlay_opacity
+
+
 def _update_hydraulic_preset(self, context):
     """Set advanced hydraulic params from preset selection."""
     presets = {
@@ -435,6 +475,40 @@ class TILEFORGE_PG_OutdoorSettings(PropertyGroup):
         min=0.0, max=1.0,
         step=5,
         precision=2,
+    )
+    edge_preserve_strength: FloatProperty(
+        name="Edge Sharpness",
+        description="Preserve sharp height transitions between zones (0=smooth ramps, 1=sharp cliffs)",
+        default=0.8,
+        min=0.0, max=1.0,
+        step=5,
+        precision=2,
+    )
+
+    # Heightmap painting
+    paint_reference_image: StringProperty(
+        name="Reference Map",
+        description="Map image to display as reference while painting elevation zones",
+        subtype='FILE_PATH',
+    )
+    paint_overlay_opacity: FloatProperty(
+        name="Paint Opacity",
+        description="Opacity of the painted height overlay on top of the reference map",
+        default=0.6,
+        min=0.1, max=1.0,
+        step=5,
+        precision=2,
+        update=_update_paint_opacity,
+    )
+    paint_resolution: IntProperty(
+        name="Paint Resolution",
+        description="Pixel resolution of the painted heightmap image",
+        default=1024,
+        min=256, max=4096,
+    )
+    is_painting: BoolProperty(
+        default=False,
+        options={'HIDDEN', 'SKIP_SAVE'},
     )
 
     # Terrain shape controls

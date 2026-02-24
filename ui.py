@@ -82,7 +82,9 @@ class TILEFORGE_PT_TileSettings(TILEFORGE_PT_Base, Panel):
         col = layout.column(align=True)
         col.prop(tile, "engrave_grid")
         if tile.engrave_grid:
-            col.prop(tile, "grid_squares")
+            col.prop(tile, "grid_preset")
+            if tile.grid_preset == 'CUSTOM':
+                col.prop(tile, "grid_squares")
             col.prop(tile, "grid_line_depth")
             col.prop(tile, "grid_line_width")
 
@@ -92,10 +94,17 @@ class TILEFORGE_PT_TileSettings(TILEFORGE_PT_Base, Panel):
         ps = tile.print_scale
         tile_mm_x = tile.tile_size_x / ps * 1000
         tile_mm_y = tile.tile_size_y / ps * 1000
-        grid_sq = tile.grid_squares
-        grid_mm_x = tile_mm_x / grid_sq
-        grid_sq_y = max(1, round(tile.tile_size_y / (tile.tile_size_x / grid_sq)))
-        grid_mm_y = tile_mm_y / grid_sq_y
+
+        _preset_sizes = {"1_INCH": 25.4, "25MM": 25.0}
+        if tile.grid_preset in _preset_sizes:
+            grid_mm_x = _preset_sizes[tile.grid_preset]
+            grid_mm_y = grid_mm_x
+        else:
+            grid_sq = tile.grid_squares
+            grid_mm_x = tile_mm_x / grid_sq
+            grid_sq_y = max(1, round(tile.tile_size_y / (tile.tile_size_x / grid_sq)))
+            grid_mm_y = tile_mm_y / grid_sq_y
+
         map_mm_x = tile.map_width / ps * 1000
         map_mm_y = tile.map_depth / ps * 1000
 
@@ -182,6 +191,7 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
 
             col.separator()
             col.prop(outdoor, "map_smoothing")
+            col.prop(outdoor, "edge_preserve_strength")
             col.prop(outdoor, "fallback_height")
 
         else:
@@ -202,6 +212,62 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
             row = col.row(align=True)
             row.prop(outdoor, "noise_seed")
             row.operator("tileforge.randomize_seed", text="", icon='FILE_REFRESH')
+
+        layout.separator()
+
+        # Paint Heightmap tool
+        # Safety check: reset is_painting if paint plane was removed externally
+        if outdoor.is_painting:
+            has_paint_obj = any(
+                obj.name.startswith("TF_Paint_") for obj in bpy.data.objects
+            )
+            if not has_paint_obj:
+                outdoor.is_painting = False
+
+        box = layout.box()
+        box.label(text="Paint Heightmap", icon='BRUSH_DATA')
+
+        if not outdoor.is_painting:
+            col = box.column(align=True)
+            col.prop(outdoor, "paint_reference_image")
+            col.prop(outdoor, "paint_resolution")
+            col.operator(
+                "tileforge.setup_heightmap_paint",
+                text="Start Painting",
+                icon='BRUSHES_ALL',
+            )
+        else:
+            col = box.column(align=True)
+            col.prop(outdoor, "paint_overlay_opacity", slider=True)
+
+            col.label(text="Height Levels:")
+            row = col.row(align=True)
+            op = row.operator("tileforge.set_brush_height", text="Sea")
+            op.level = 'SEA'
+            op = row.operator("tileforge.set_brush_height", text="Low")
+            op.level = 'LOW'
+            op = row.operator("tileforge.set_brush_height", text="Mid")
+            op.level = 'MID'
+            row = col.row(align=True)
+            op = row.operator("tileforge.set_brush_height", text="High")
+            op.level = 'HIGH'
+            op = row.operator("tileforge.set_brush_height", text="Peak")
+            op.level = 'PEAK'
+            op = row.operator("tileforge.set_brush_height", text="Eraser")
+            op.level = 'ERASER'
+
+            col.separator()
+            row = col.row(align=True)
+            row.operator(
+                "tileforge.apply_painted_heightmap",
+                text="Apply Heightmap",
+                icon='CHECKMARK',
+            )
+            row.operator(
+                "tileforge.cancel_paint_mode",
+                text="Cancel",
+                icon='X',
+            )
 
         layout.separator()
 
@@ -235,7 +301,8 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
 
             box.separator()
 
-            # Terracing (hidden for image-based modes)
+        # Terracing (available for procedural and color-map modes)
+        if outdoor.terrain_type != "CUSTOM":
             col = box.column(align=True)
             col.prop(outdoor, "enable_terracing")
             if outdoor.enable_terracing:
