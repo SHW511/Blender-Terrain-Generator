@@ -257,6 +257,13 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
             op.level = 'ERASER'
 
             col.separator()
+            col.operator(
+                "tileforge.save_paint_progress",
+                text="Save Progress",
+                icon='FILE_TICK',
+            )
+
+            col.separator()
             row = col.row(align=True)
             row.operator(
                 "tileforge.apply_painted_heightmap",

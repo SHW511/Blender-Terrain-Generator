@@ -550,6 +550,14 @@ class TILEFORGE_OT_SetupHeightmapPaint(Operator):
             )
             # Start fully transparent so the reference shows through
             paint_img.pixels[:] = [0.0] * (res * res * 4)
+
+            # Load saved progress from disk if available
+            progress_path = _paint_progress_path(outdoor)
+            if progress_path and os.path.isfile(progress_path):
+                saved = bpy.data.images.load(progress_path, check_existing=False)
+                if saved.size[0] == res and saved.size[1] == res:
+                    paint_img.pixels[:] = list(saved.pixels)
+                bpy.data.images.remove(saved)
         paint_img.use_fake_user = True
 
         # Create plane matching image aspect ratio
@@ -760,6 +768,11 @@ class TILEFORGE_OT_ApplyPaintedHeightmap(Operator):
         outdoor.heightmap_image = out_path
         outdoor.terrain_type = "CUSTOM"
 
+        # Delete progress file — work is finalized
+        progress = _paint_progress_path(outdoor)
+        if progress and os.path.isfile(progress):
+            os.remove(progress)
+
         # Clean up paint objects and images
         _remove_objects_by_prefix("TF_Paint_")
         mat = bpy.data.materials.get("TF_Paint_Material")
@@ -798,6 +811,33 @@ class TILEFORGE_OT_CancelPaintMode(Operator):
 
         outdoor.is_painting = False
         self.report({'INFO'}, "Paint mode cancelled")
+        return {'FINISHED'}
+
+
+class TILEFORGE_OT_SavePaintProgress(Operator):
+    """Save current paint progress to disk so you can resume later"""
+    bl_idname = "tileforge.save_paint_progress"
+    bl_label = "Save Progress"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+
+        paint_img = bpy.data.images.get("TF_Paint_Heightmap")
+        if not paint_img:
+            self.report({'ERROR'}, "No painted heightmap to save")
+            return {'CANCELLED'}
+
+        progress_path = _paint_progress_path(outdoor)
+        if not progress_path:
+            self.report({'ERROR'}, "No reference image set — cannot determine save path")
+            return {'CANCELLED'}
+
+        paint_img.filepath_raw = progress_path
+        paint_img.file_format = 'PNG'
+        paint_img.save()
+
+        self.report({'INFO'}, f"Progress saved to {progress_path}")
         return {'FINISHED'}
 
 
@@ -845,6 +885,14 @@ def _remove_objects_by_prefix(prefix):
     return len(to_remove)
 
 
+def _paint_progress_path(outdoor):
+    """Return deterministic path for paint progress file next to the reference image."""
+    ref = bpy.path.abspath(outdoor.paint_reference_image)
+    if not ref:
+        return ""
+    return os.path.join(os.path.dirname(ref), "tileforge_paint_progress.png")
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -864,6 +912,7 @@ _classes = (
     TILEFORGE_OT_SetBrushHeight,
     TILEFORGE_OT_ApplyPaintedHeightmap,
     TILEFORGE_OT_CancelPaintMode,
+    TILEFORGE_OT_SavePaintProgress,
     TILEFORGE_OT_CleanupAll,
 )
 
