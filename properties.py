@@ -344,6 +344,16 @@ class TILEFORGE_PG_NoiseLayer(PropertyGroup):
     )
 
 
+def _update_paint_opacity(self, context):
+    """Update the paint overlay opacity in the material node tree."""
+    mat = bpy.data.materials.get("TF_Paint_Material")
+    if not mat or not mat.node_tree:
+        return
+    node = mat.node_tree.nodes.get("TF_OpacityMult")
+    if node:
+        node.inputs[1].default_value = self.paint_overlay_opacity
+
+
 def _update_hydraulic_preset(self, context):
     """Set advanced hydraulic params from preset selection."""
     presets = {
@@ -465,6 +475,40 @@ class TILEFORGE_PG_OutdoorSettings(PropertyGroup):
         min=0.0, max=1.0,
         step=5,
         precision=2,
+    )
+    edge_preserve_strength: FloatProperty(
+        name="Edge Sharpness",
+        description="Preserve sharp height transitions between zones (0=smooth ramps, 1=sharp cliffs)",
+        default=0.8,
+        min=0.0, max=1.0,
+        step=5,
+        precision=2,
+    )
+
+    # Heightmap painting
+    paint_reference_image: StringProperty(
+        name="Reference Map",
+        description="Map image to display as reference while painting elevation zones",
+        subtype='FILE_PATH',
+    )
+    paint_overlay_opacity: FloatProperty(
+        name="Paint Opacity",
+        description="Opacity of the painted height overlay on top of the reference map",
+        default=0.6,
+        min=0.1, max=1.0,
+        step=5,
+        precision=2,
+        update=_update_paint_opacity,
+    )
+    paint_resolution: IntProperty(
+        name="Paint Resolution",
+        description="Pixel resolution of the painted heightmap image",
+        default=1024,
+        min=256, max=4096,
+    )
+    is_painting: BoolProperty(
+        default=False,
+        options={'HIDDEN', 'SKIP_SAVE'},
     )
 
     # Terrain shape controls

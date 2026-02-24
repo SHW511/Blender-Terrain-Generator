@@ -1250,6 +1250,46 @@ def _smooth_z(bm, iterations):
             v.co.z = new_z[v.index]
 
 
+def _smooth_z_bilateral(bm, iterations, edge_threshold):
+    """Edge-preserving Z smoothing using bilateral weighting.
+
+    Like _smooth_z but weights each neighbor's contribution by how close its
+    height is to the current vertex.  Neighbors at a similar height contribute
+    fully (smoothing jagged pixel edges), while neighbors across a large height
+    step contribute very little (preserving cliff edges).
+
+    Args:
+        bm: BMesh to smooth
+        iterations: Number of smoothing passes
+        edge_threshold: Height difference sigma — small values preserve more
+            edges, large values approach standard Laplacian smoothing.
+            A value of 0 disables neighbor weighting (pure Laplacian).
+    """
+    if edge_threshold <= 0.0:
+        _smooth_z(bm, iterations)
+        return
+
+    inv_2sigma2 = 1.0 / (2.0 * edge_threshold * edge_threshold)
+
+    for _ in range(iterations):
+        new_z = {}
+        for v in bm.verts:
+            neighbors = [e.other_vert(v) for e in v.link_edges]
+            if not neighbors:
+                new_z[v.index] = v.co.z
+                continue
+            total_w = 1.0   # self-weight
+            total_z = v.co.z
+            for n in neighbors:
+                dz = n.co.z - v.co.z
+                w = math.exp(-(dz * dz) * inv_2sigma2)
+                total_w += w
+                total_z += n.co.z * w
+            new_z[v.index] = total_z / total_w
+        for v in bm.verts:
+            v.co.z = new_z[v.index]
+
+
 def _hsv_distance_sq(h1, s1, v1, h2, s2, v2):
     """Compute weighted squared HSV distance between two HSV colors.
 
@@ -1357,9 +1397,61 @@ def apply_color_map(obj, image_path, settings_outdoor, settings_tile):
 
         v.co.z = height_offset + best_height * height_range
 
-    # Apply Z-only Laplacian smoothing
+    # Apply smoothing — bilateral when edge preservation is enabled
     if settings_outdoor.map_smoothing > 0:
-        _smooth_z(bm, settings_outdoor.map_smoothing)
+        edge_strength = settings_outdoor.edge_preserve_strength
+        if edge_strength > 0.0 and height_range > 1e-9:
+            # Scale threshold inversely with edge strength:
+            # strength=1 → small threshold (sharp edges)
+            # strength→0 → large threshold (approaches Laplacian)
+            sigma = height_range * 0.5 * (1.0 - edge_strength * 0.95)
+            _smooth_z_bilateral(bm, settings_outdoor.map_smoothing, sigma)
+        else:
+            _smooth_z(bm, settings_outdoor.map_smoothing)
+
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+
+def apply_terracing_post(obj, settings_outdoor, settings_tile):
+    """Re-quantize vertex heights into discrete terrace levels.
+
+    Works as a post-processing pass on any mesh — reads the current Z range,
+    normalizes, quantizes to the requested number of levels, and writes back.
+    Useful after color-map smoothing to re-sharpen height plateaus.
+
+    Args:
+        obj: Blender mesh object
+        settings_outdoor: TILEFORGE_PG_OutdoorSettings (terrace_levels, terrace_sharpness)
+        settings_tile: TILEFORGE_PG_TileSettings (print_scale)
+    """
+    levels = settings_outdoor.terrace_levels
+    sharpness = settings_outdoor.terrace_sharpness
+    if levels < 2:
+        return
+
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+
+    # Find Z range across all verts
+    z_vals = [v.co.z for v in bm.verts]
+    if not z_vals:
+        bm.free()
+        return
+    z_min = min(z_vals)
+    z_max = max(z_vals)
+    z_range = z_max - z_min
+    if z_range < 1e-8:
+        bm.free()
+        return
+
+    for v in bm.verts:
+        normalized = (v.co.z - z_min) / z_range
+        terraced = round(normalized * levels) / levels
+        blended = normalized + (terraced - normalized) * sharpness
+        v.co.z = z_min + blended * z_range
 
     bm.to_mesh(mesh)
     bm.free()

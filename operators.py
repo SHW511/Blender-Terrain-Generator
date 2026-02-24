@@ -56,6 +56,8 @@ class TILEFORGE_OT_GenerateTerrain(Operator):
             mesh_gen.apply_heightmap(obj, outdoor.heightmap_image, outdoor, tile)
         elif outdoor.terrain_type == "MAP_IMAGE" and outdoor.heightmap_image:
             mesh_gen.apply_color_map(obj, outdoor.heightmap_image, outdoor, tile)
+            if outdoor.enable_terracing:
+                mesh_gen.apply_terracing_post(obj, outdoor, tile)
         else:
             mesh_gen.apply_procedural_noise(obj, outdoor, tile)
         wm.progress_update(2)
@@ -511,6 +513,295 @@ class TILEFORGE_OT_RemoveColorZone(Operator):
 
 
 # ---------------------------------------------------------------------------
+# Heightmap painting
+# ---------------------------------------------------------------------------
+
+class TILEFORGE_OT_SetupHeightmapPaint(Operator):
+    """Set up a textured plane for painting elevation zones over a reference map"""
+    bl_idname = "tileforge.setup_heightmap_paint"
+    bl_label = "Start Painting"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+
+        ref_path = bpy.path.abspath(outdoor.paint_reference_image)
+        if not ref_path or not os.path.isfile(ref_path):
+            self.report({'ERROR'}, "Reference map image not found")
+            return {'CANCELLED'}
+
+        # Clean up any previous paint objects
+        _remove_objects_by_prefix("TF_Paint_")
+
+        # Load reference image
+        ref_img = bpy.data.images.load(ref_path, check_existing=True)
+        img_w, img_h = ref_img.size
+
+        # Create or reuse paint image (preserves previous strokes on re-entry)
+        res = outdoor.paint_resolution
+        paint_img = bpy.data.images.get("TF_Paint_Heightmap")
+        if paint_img and (paint_img.size[0] != res or paint_img.size[1] != res):
+            bpy.data.images.remove(paint_img)
+            paint_img = None
+        if not paint_img:
+            paint_img = bpy.data.images.new(
+                "TF_Paint_Heightmap", width=res, height=res,
+                alpha=True, float_buffer=False,
+            )
+            # Start fully transparent so the reference shows through
+            paint_img.pixels[:] = [0.0] * (res * res * 4)
+        paint_img.use_fake_user = True
+
+        # Create plane matching image aspect ratio
+        aspect = img_w / max(img_h, 1)
+        size_y = 2.0
+        size_x = size_y * aspect
+
+        bm = bmesh.new()
+        verts = [
+            bm.verts.new((-size_x / 2, -size_y / 2, 0)),
+            bm.verts.new(( size_x / 2, -size_y / 2, 0)),
+            bm.verts.new(( size_x / 2,  size_y / 2, 0)),
+            bm.verts.new((-size_x / 2,  size_y / 2, 0)),
+        ]
+        face = bm.faces.new(verts)
+
+        # UV mapping
+        uv_layer = bm.loops.layers.uv.new("UVMap")
+        uvs = [(0, 0), (1, 0), (1, 1), (0, 1)]
+        for loop, uv in zip(face.loops, uvs):
+            loop[uv_layer].uv = uv
+
+        mesh = bpy.data.meshes.new("TF_Paint_Plane_Mesh")
+        bm.to_mesh(mesh)
+        bm.free()
+
+        plane_obj = bpy.data.objects.new("TF_Paint_Plane", mesh)
+        context.collection.objects.link(plane_obj)
+
+        # Build material with reference + paint overlay
+        mat = bpy.data.materials.new("TF_Paint_Material")
+        mat.use_nodes = True
+        tree = mat.node_tree
+        tree.nodes.clear()
+
+        # Nodes
+        n_ref = tree.nodes.new('ShaderNodeTexImage')
+        n_ref.name = "TF_RefTex"
+        n_ref.image = ref_img
+        n_ref.location = (-600, 300)
+
+        n_paint = tree.nodes.new('ShaderNodeTexImage')
+        n_paint.name = "TF_PaintTex"
+        n_paint.image = paint_img
+        n_paint.location = (-600, -100)
+
+        n_mult = tree.nodes.new('ShaderNodeMath')
+        n_mult.name = "TF_OpacityMult"
+        n_mult.operation = 'MULTIPLY'
+        n_mult.inputs[1].default_value = outdoor.paint_overlay_opacity
+        n_mult.location = (-100, -200)
+
+        n_mix = tree.nodes.new('ShaderNodeMix')
+        n_mix.name = "TF_MixColor"
+        n_mix.data_type = 'RGBA'
+        n_mix.location = (100, 200)
+
+        n_bsdf = tree.nodes.new('ShaderNodeBsdfPrincipled')
+        n_bsdf.location = (400, 200)
+
+        n_out = tree.nodes.new('ShaderNodeOutputMaterial')
+        n_out.location = (700, 200)
+
+        # Links
+        links = tree.links
+        links.new(n_paint.outputs['Alpha'], n_mult.inputs[0])
+        links.new(n_mult.outputs['Value'], n_mix.inputs['Factor'])
+        links.new(n_ref.outputs['Color'], n_mix.inputs[6])   # A input
+        links.new(n_paint.outputs['Color'], n_mix.inputs[7])  # B input
+        links.new(n_mix.outputs[2], n_bsdf.inputs['Base Color'])  # Result
+        links.new(n_bsdf.outputs['BSDF'], n_out.inputs['Surface'])
+
+        # Set paint texture as active for texture paint mode
+        mat.node_tree.nodes.active = n_paint
+
+        plane_obj.data.materials.append(mat)
+
+        # Select plane and enter texture paint mode
+        bpy.ops.object.select_all(action='DESELECT')
+        plane_obj.select_set(True)
+        context.view_layer.objects.active = plane_obj
+        bpy.ops.object.mode_set(mode='TEXTURE_PAINT')
+
+        # Configure brush for mid-gray default
+        ip = context.tool_settings.image_paint
+        brush = ip.brush
+        if brush:
+            brush.color = (0.5, 0.5, 0.5)
+            brush.blend = 'MIX'
+            ups = ip.unified_paint_settings
+            if ups.use_unified_color:
+                ups.color = (0.5, 0.5, 0.5)
+
+        # Switch viewport to Material Preview
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D':
+                        space.shading.type = 'MATERIAL'
+                        break
+                break
+
+        outdoor.is_painting = True
+        self.report({'INFO'}, "Paint elevation zones on the map — use height level buttons")
+        return {'FINISHED'}
+
+
+class TILEFORGE_OT_SetBrushHeight(Operator):
+    """Set the paint brush to a specific elevation level"""
+    bl_idname = "tileforge.set_brush_height"
+    bl_label = "Set Brush Height"
+    bl_options = {'REGISTER'}
+
+    level: bpy.props.EnumProperty(
+        name="Level",
+        items=[
+            ("SEA",    "Sea",    "Lowest elevation — black (0.0)"),
+            ("LOW",    "Low",    "Low elevation (0.25)"),
+            ("MID",    "Mid",    "Mid elevation (0.5)"),
+            ("HIGH",   "High",   "High elevation (0.75)"),
+            ("PEAK",   "Peak",   "Highest elevation — white (1.0)"),
+            ("ERASER", "Eraser", "Erase painted areas to reveal reference"),
+        ],
+    )
+
+    _gray_values = {"SEA": 0.0, "LOW": 0.25, "MID": 0.5, "HIGH": 0.75, "PEAK": 1.0}
+
+    def execute(self, context):
+        # Ensure we're in texture paint mode
+        if context.mode != 'PAINT_TEXTURE':
+            obj = context.active_object
+            if obj:
+                bpy.ops.object.mode_set(mode='TEXTURE_PAINT')
+
+        brush = context.tool_settings.image_paint.brush
+        if not brush:
+            self.report({'WARNING'}, "No active paint brush")
+            return {'CANCELLED'}
+
+        if self.level == "ERASER":
+            brush.blend = 'ERASE_ALPHA'
+        else:
+            brush.blend = 'MIX'
+            g = self._gray_values[self.level]
+            color = (g, g, g)
+            brush.color = color
+            # Blender 5.0 moved unified_paint_settings into each Paint struct
+            ups = context.tool_settings.image_paint.unified_paint_settings
+            if ups.use_unified_color:
+                ups.color = color
+
+        return {'FINISHED'}
+
+
+class TILEFORGE_OT_ApplyPaintedHeightmap(Operator):
+    """Convert the painted overlay to a grayscale heightmap and set it as Custom Heightmap"""
+    bl_idname = "tileforge.apply_painted_heightmap"
+    bl_label = "Apply Heightmap"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+
+        # Exit paint mode
+        if context.mode == 'PAINT_TEXTURE':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        paint_img = bpy.data.images.get("TF_Paint_Heightmap")
+        if not paint_img:
+            self.report({'ERROR'}, "No painted heightmap found")
+            return {'CANCELLED'}
+
+        # Convert RGBA to grayscale PNG
+        w, h = paint_img.size
+        px = list(paint_img.pixels)  # flat RGBA
+        gray_pixels = [0.0] * (w * h * 4)
+
+        for i in range(w * h):
+            r = px[i * 4]
+            a = px[i * 4 + 3]
+            # Painted areas use their RGB value; unpainted (alpha=0) default to mid
+            g = r * a + 0.5 * (1.0 - a)
+            gray_pixels[i * 4]     = g
+            gray_pixels[i * 4 + 1] = g
+            gray_pixels[i * 4 + 2] = g
+            gray_pixels[i * 4 + 3] = 1.0
+
+        # Create output image
+        out_img = bpy.data.images.new(
+            "TF_Paint_Output", width=w, height=h,
+            alpha=False, float_buffer=False,
+        )
+        out_img.pixels[:] = gray_pixels
+
+        # Save next to the reference image
+        ref_path = bpy.path.abspath(outdoor.paint_reference_image)
+        out_dir = os.path.dirname(ref_path) if ref_path else ""
+        if not out_dir:
+            out_dir = bpy.path.abspath("//")
+        out_path = os.path.join(out_dir, "tileforge_painted_heightmap.png")
+
+        out_img.filepath_raw = out_path
+        out_img.file_format = 'PNG'
+        out_img.save()
+        bpy.data.images.remove(out_img)
+
+        # Set as custom heightmap
+        outdoor.heightmap_image = out_path
+        outdoor.terrain_type = "CUSTOM"
+
+        # Clean up paint objects and images
+        _remove_objects_by_prefix("TF_Paint_")
+        mat = bpy.data.materials.get("TF_Paint_Material")
+        if mat:
+            bpy.data.materials.remove(mat)
+        paint_img = bpy.data.images.get("TF_Paint_Heightmap")
+        if paint_img:
+            bpy.data.images.remove(paint_img)
+
+        outdoor.is_painting = False
+        self.report({'INFO'}, f"Heightmap saved to {out_path}")
+        return {'FINISHED'}
+
+
+class TILEFORGE_OT_CancelPaintMode(Operator):
+    """Cancel painting and discard the painted heightmap"""
+    bl_idname = "tileforge.cancel_paint_mode"
+    bl_label = "Cancel"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+
+        # Exit paint mode
+        if context.mode == 'PAINT_TEXTURE':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Remove paint objects
+        _remove_objects_by_prefix("TF_Paint_")
+        mat = bpy.data.materials.get("TF_Paint_Material")
+        if mat:
+            bpy.data.materials.remove(mat)
+        paint_img = bpy.data.images.get("TF_Paint_Heightmap")
+        if paint_img:
+            bpy.data.images.remove(paint_img)
+
+        outdoor.is_painting = False
+        self.report({'INFO'}, "Paint mode cancelled")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
 # Cleanup utility
 # ---------------------------------------------------------------------------
 
@@ -524,6 +815,18 @@ class TILEFORGE_OT_CleanupAll(Operator):
         count = 0
         count += _remove_objects_by_prefix("TF_Preview")
         count += _remove_objects_by_prefix("tile_r")
+        count += _remove_objects_by_prefix("TF_Paint_")
+
+        # Reset painting state
+        outdoor = context.scene.tile_forge.outdoor
+        if outdoor.is_painting:
+            if context.mode == 'PAINT_TEXTURE':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            outdoor.is_painting = False
+        mat = bpy.data.materials.get("TF_Paint_Material")
+        if mat:
+            bpy.data.materials.remove(mat)
+
         self.report({'INFO'}, f"Removed {count} objects")
         return {'FINISHED'}
 
@@ -557,6 +860,10 @@ _classes = (
     TILEFORGE_OT_RemoveNoiseLayer,
     TILEFORGE_OT_AddColorZone,
     TILEFORGE_OT_RemoveColorZone,
+    TILEFORGE_OT_SetupHeightmapPaint,
+    TILEFORGE_OT_SetBrushHeight,
+    TILEFORGE_OT_ApplyPaintedHeightmap,
+    TILEFORGE_OT_CancelPaintMode,
     TILEFORGE_OT_CleanupAll,
 )
 

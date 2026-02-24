@@ -191,6 +191,7 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
 
             col.separator()
             col.prop(outdoor, "map_smoothing")
+            col.prop(outdoor, "edge_preserve_strength")
             col.prop(outdoor, "fallback_height")
 
         else:
@@ -211,6 +212,62 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
             row = col.row(align=True)
             row.prop(outdoor, "noise_seed")
             row.operator("tileforge.randomize_seed", text="", icon='FILE_REFRESH')
+
+        layout.separator()
+
+        # Paint Heightmap tool
+        # Safety check: reset is_painting if paint plane was removed externally
+        if outdoor.is_painting:
+            has_paint_obj = any(
+                obj.name.startswith("TF_Paint_") for obj in bpy.data.objects
+            )
+            if not has_paint_obj:
+                outdoor.is_painting = False
+
+        box = layout.box()
+        box.label(text="Paint Heightmap", icon='BRUSH_DATA')
+
+        if not outdoor.is_painting:
+            col = box.column(align=True)
+            col.prop(outdoor, "paint_reference_image")
+            col.prop(outdoor, "paint_resolution")
+            col.operator(
+                "tileforge.setup_heightmap_paint",
+                text="Start Painting",
+                icon='BRUSHES_ALL',
+            )
+        else:
+            col = box.column(align=True)
+            col.prop(outdoor, "paint_overlay_opacity", slider=True)
+
+            col.label(text="Height Levels:")
+            row = col.row(align=True)
+            op = row.operator("tileforge.set_brush_height", text="Sea")
+            op.level = 'SEA'
+            op = row.operator("tileforge.set_brush_height", text="Low")
+            op.level = 'LOW'
+            op = row.operator("tileforge.set_brush_height", text="Mid")
+            op.level = 'MID'
+            row = col.row(align=True)
+            op = row.operator("tileforge.set_brush_height", text="High")
+            op.level = 'HIGH'
+            op = row.operator("tileforge.set_brush_height", text="Peak")
+            op.level = 'PEAK'
+            op = row.operator("tileforge.set_brush_height", text="Eraser")
+            op.level = 'ERASER'
+
+            col.separator()
+            row = col.row(align=True)
+            row.operator(
+                "tileforge.apply_painted_heightmap",
+                text="Apply Heightmap",
+                icon='CHECKMARK',
+            )
+            row.operator(
+                "tileforge.cancel_paint_mode",
+                text="Cancel",
+                icon='X',
+            )
 
         layout.separator()
 
@@ -244,7 +301,8 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
 
             box.separator()
 
-            # Terracing (hidden for image-based modes)
+        # Terracing (available for procedural and color-map modes)
+        if outdoor.terrain_type != "CUSTOM":
             col = box.column(align=True)
             col.prop(outdoor, "enable_terracing")
             if outdoor.enable_terracing:
