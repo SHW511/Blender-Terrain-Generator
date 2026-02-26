@@ -742,8 +742,14 @@ _MAX_DISP = mm(0.5)
 
 
 def apply_ground_texture(obj, floor_texture, texture_strength, settings_tile,
-                         floor_only_z=None):
+                         floor_only_z=None,
+                         road_mask_pixels=None, road_mask_w=0, road_mask_h=0,
+                         road_texture='NONE', road_texture_strength=0.3,
+                         road_texture_scale=2.0, road_cobble_density=0.5):
     """Apply micro-displacement ground texture to mesh surface.
+
+    When a road mask is provided, applies different textures to road vs terrain
+    vertices with smooth blending in the transition zone.
 
     Args:
         obj: Blender mesh object
@@ -751,43 +757,141 @@ def apply_ground_texture(obj, floor_texture, texture_strength, settings_tile,
         texture_strength: 0..1 intensity multiplier
         settings_tile: TILEFORGE_PG_TileSettings
         floor_only_z: If set, skip vertices with z > this value (dungeon walls)
+        road_mask_pixels: Flat RGBA pixel array from TF_RoadPaint_Mask (or None)
+        road_mask_w: Mask image width in pixels
+        road_mask_h: Mask image height in pixels
+        road_texture: Road texture enum string (NONE = same as terrain)
+        road_texture_strength: 0..1 intensity for road texture
+        road_texture_scale: Scale multiplier for road texture pattern
     """
-    if texture_strength <= 0.0:
+    if texture_strength <= 0.0 and road_texture_strength <= 0.0:
         return
-
-    mesh = obj.data
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-
-    print_scale = settings_tile.print_scale
-    half_x = m(settings_tile.map_width, print_scale) / 2.0
-    half_y = m(settings_tile.map_depth, print_scale) / 2.0
 
     dispatch = {
         "STONE_SLAB": _texture_stone_slab,
         "COBBLESTONE": _texture_cobblestone,
         "WOOD_PLANK": _texture_wood_plank,
         "DIRT": _texture_dirt,
+        "FLAGSTONE": _texture_flagstone,
     }
 
-    func = dispatch.get(floor_texture)
-    if func:
-        func(bm, half_x, half_y, texture_strength, floor_only_z)
+    mesh = obj.data
+    print_scale = settings_tile.print_scale
+    half_x = m(settings_tile.map_width, print_scale) / 2.0
+    half_y = m(settings_tile.map_depth, print_scale) / 2.0
+
+    # --- Fast path: no road mask or road uses same texture as terrain ---
+    has_road_mask = (road_mask_pixels is not None
+                     and road_mask_w > 0 and road_mask_h > 0
+                     and road_texture != 'NONE')
+
+    if not has_road_mask:
+        if texture_strength <= 0.0:
+            return
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        func = dispatch.get(floor_texture)
+        if func:
+            func(bm, half_x, half_y, texture_strength, floor_only_z)
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+        return
+
+    # --- Road-aware path: separate textures for terrain and road ---
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+
+    # Pre-compute per-vertex alpha and classify into three zones
+    vert_alpha = {}      # only blend-zone vertices need alpha stored
+    terrain_set = set()  # alpha < 0.05 — terrain texture only
+    road_set = set()     # alpha > 0.95 — road texture only
+    blend_set = set()    # between — smooth blend of both textures
+    for v in bm.verts:
+        if floor_only_z is not None and v.co.z > floor_only_z:
+            continue
+        u = (v.co.x + half_x) / (2.0 * half_x) if half_x > 0 else 0.5
+        vv = (v.co.y + half_y) / (2.0 * half_y) if half_y > 0 else 0.5
+        u = max(0.0, min(1.0, u))
+        vv = max(0.0, min(1.0, vv))
+        alpha = _sample_bilinear(road_mask_pixels, road_mask_w, road_mask_h,
+                                 u, vv, channel=3)
+        if alpha < 0.05:
+            terrain_set.add(v.index)
+        elif alpha > 0.95:
+            road_set.add(v.index)
+        else:
+            blend_set.add(v.index)
+            vert_alpha[v.index] = alpha
+
+    # Save original Z for blend vertices before any texture is applied
+    blend_original_z = {}
+    for vi in blend_set:
+        blend_original_z[vi] = bm.verts[vi].co.z
+
+    # 1) Apply terrain texture to terrain-only + blend vertices
+    terrain_and_blend = terrain_set | blend_set
+    if texture_strength > 0.0 and terrain_and_blend:
+        terrain_func = dispatch.get(floor_texture)
+        if terrain_func:
+            terrain_func(bm, half_x, half_y, texture_strength, floor_only_z,
+                         vert_filter=lambda vi: vi in terrain_and_blend)
+
+    # 2) Snapshot blend vertex Z after terrain texture
+    blend_terrain_z = {}
+    for vi in blend_set:
+        blend_terrain_z[vi] = bm.verts[vi].co.z
+
+    # 3) Reset blend vertices to original Z for road texture pass
+    for vi in blend_set:
+        bm.verts[vi].co.z = blend_original_z[vi]
+
+    # 4) Apply road texture to road-only + blend vertices
+    road_and_blend = road_set | blend_set
+    if road_texture_strength > 0.0 and road_and_blend:
+        road_func = dispatch.get(road_texture)
+        if road_func:
+            road_kwargs = dict(scale_mult=road_texture_scale,
+                               vert_filter=lambda vi: vi in road_and_blend)
+            if road_texture == 'COBBLESTONE':
+                road_kwargs['cobble_density'] = road_cobble_density
+            road_func(bm, half_x, half_y, road_texture_strength, floor_only_z,
+                      **road_kwargs)
+
+    # 5) Snapshot blend vertex Z after road texture
+    blend_road_z = {}
+    for vi in blend_set:
+        blend_road_z[vi] = bm.verts[vi].co.z
+
+    # 6) Lerp blend vertices: terrain_z -> road_z based on remapped alpha
+    for vi in blend_set:
+        alpha = vert_alpha.get(vi, 0.0)
+        # Remap alpha from 0.05..0.95 to 0..1
+        t = max(0.0, min(1.0, (alpha - 0.05) / 0.9))
+        # Smooth hermite interpolation for gentle transition
+        t = t * t * (3.0 - 2.0 * t)
+        terrain_z = blend_terrain_z[vi]
+        road_z = blend_road_z[vi]
+        bm.verts[vi].co.z = terrain_z + (road_z - terrain_z) * t
 
     bm.to_mesh(mesh)
     bm.free()
     mesh.update()
 
 
-def _texture_stone_slab(bm, half_x, half_y, strength, floor_only_z):
+def _texture_stone_slab(bm, half_x, half_y, strength, floor_only_z,
+                        scale_mult=1.0, vert_filter=None):
     """Rectangular stone slab pattern — 17x12mm slabs with smooth grooves."""
-    slab_w = mm(17.0)
-    slab_h = mm(12.0)
+    slab_w = mm(17.0) / scale_mult
+    slab_h = mm(12.0) / scale_mult
     groove_half = slab_w * 0.15  # 15% of slab width — wide enough for any resolution
     disp = _MAX_DISP * strength
 
     for v in bm.verts:
         if floor_only_z is not None and v.co.z > floor_only_z:
+            continue
+        if vert_filter is not None and not vert_filter(v.index):
             continue
 
         # Position in slab space (offset to avoid groove at origin center)
@@ -811,13 +915,18 @@ def _texture_stone_slab(bm, half_x, half_y, strength, floor_only_z):
         v.co.z += (-groove_factor + n * 0.3 * (1.0 - groove_factor)) * disp
 
 
-def _texture_cobblestone(bm, half_x, half_y, strength, floor_only_z):
+def _texture_cobblestone(bm, half_x, half_y, strength, floor_only_z,
+                         scale_mult=1.0, vert_filter=None, cobble_density=0.5):
     """Voronoi cell-based cobblestone pattern — rounded domes with gaps."""
     disp = _MAX_DISP * strength
-    scale = 8.0
+    scale = 8.0 * scale_mult
+    # Gap factor: density 0 → 5.0 (wide gaps), density 1 → 1.5 (nearly touching)
+    gap_factor = 5.0 - 3.5 * cobble_density
 
     for v in bm.verts:
         if floor_only_z is not None and v.co.z > floor_only_z:
+            continue
+        if vert_filter is not None and not vert_filter(v.index):
             continue
 
         sample = Vector((
@@ -830,7 +939,7 @@ def _texture_cobblestone(bm, half_x, half_y, strength, floor_only_z):
         dist_f1 = cell[0][0] if cell else 0.0
 
         # Dome profile: rounded stone tops, dips at boundaries
-        dome = max(0.0, (1.0 - dist_f1 * 3.0))
+        dome = max(0.0, (1.0 - dist_f1 * gap_factor))
         dome = dome * dome  # Square for smoother shape
 
         # Per-cell height variation
@@ -840,14 +949,17 @@ def _texture_cobblestone(bm, half_x, half_y, strength, floor_only_z):
         v.co.z += dome * disp * variation
 
 
-def _texture_wood_plank(bm, half_x, half_y, strength, floor_only_z):
+def _texture_wood_plank(bm, half_x, half_y, strength, floor_only_z,
+                        scale_mult=1.0, vert_filter=None):
     """Parallel wood plank pattern along X axis — 6mm wide with grain."""
-    plank_w = mm(6.0)
+    plank_w = mm(6.0) / scale_mult
     groove_half = plank_w * 0.15  # 15% of plank width — resolution-independent
     disp = _MAX_DISP * strength
 
     for v in bm.verts:
         if floor_only_z is not None and v.co.z > floor_only_z:
+            continue
+        if vert_filter is not None and not vert_filter(v.index):
             continue
 
         # Plank index from Y position
@@ -876,12 +988,15 @@ def _texture_wood_plank(bm, half_x, half_y, strength, floor_only_z):
                     * (1.0 - groove_factor)) * disp
 
 
-def _texture_dirt(bm, half_x, half_y, strength, floor_only_z):
+def _texture_dirt(bm, half_x, half_y, strength, floor_only_z,
+                  scale_mult=1.0, vert_filter=None):
     """Multi-octave fBm dirt texture — high frequency organic roughness."""
     disp = _MAX_DISP * strength
 
     for v in bm.verts:
         if floor_only_z is not None and v.co.z > floor_only_z:
+            continue
+        if vert_filter is not None and not vert_filter(v.index):
             continue
 
         # Normalize position
@@ -889,16 +1004,59 @@ def _texture_dirt(bm, half_x, half_y, strength, floor_only_z):
         ny = (v.co.y + half_y) / (2.0 * half_y) if half_y > 0 else 0.5
 
         # High-frequency fBm
-        sample_fine = Vector((nx * 15.0, ny * 15.0, 0.0))
+        sample_fine = Vector((nx * 15.0 * scale_mult, ny * 15.0 * scale_mult, 0.0))
         fbm = mathnoise.fractal(sample_fine, 0.5, 2.0, 6,
                                 noise_basis='PERLIN_NEW')
 
         # Secondary broader turbulence
-        sample_broad = Vector((nx * 4.5, ny * 4.5, 1.7))
+        sample_broad = Vector((nx * 4.5 * scale_mult, ny * 4.5 * scale_mult, 1.7))
         turb = mathnoise.turbulence(sample_broad, 3, False)
 
         combined = fbm * 0.7 + (turb - 0.5) * 0.6
         v.co.z += combined * disp
+
+
+def _texture_flagstone(bm, half_x, half_y, strength, floor_only_z,
+                       scale_mult=1.0, vert_filter=None):
+    """Jittered rectangular flagstone pattern — organic but structured paving."""
+    stone_w = mm(10.0) / scale_mult
+    stone_h = mm(7.0) / scale_mult
+    groove_half = stone_w * 0.12  # Thinner mortar than stone_slab
+    disp = _MAX_DISP * strength
+
+    for v in bm.verts:
+        if floor_only_z is not None and v.co.z > floor_only_z:
+            continue
+        if vert_filter is not None and not vert_filter(v.index):
+            continue
+
+        # Base grid coordinates
+        raw_ix = (v.co.x + half_x) / stone_w
+        raw_iy = (v.co.y + half_y) / stone_h
+        ix = int(raw_ix)
+        iy = int(raw_iy)
+
+        # Per-row/column jitter offsets for organic mortar lines
+        jitter_x = mathnoise.noise(Vector((iy * 3.71, 0.0, 7.3))) * 0.3 * stone_w
+        jitter_y = mathnoise.noise(Vector((0.0, ix * 2.93, 4.1))) * 0.2 * stone_h
+
+        # Position within jittered cell
+        sx = ((v.co.x + half_x) - ix * stone_w - jitter_x) % stone_w
+        sy = ((v.co.y + half_y) - iy * stone_h - jitter_y) % stone_h
+
+        # Distance to nearest edge
+        dx = min(sx, stone_w - sx)
+        dy = min(sy, stone_h - sy)
+        edge_dist = min(dx, dy)
+
+        # Squared groove falloff
+        groove_factor = max(0.0, 1.0 - edge_dist / groove_half)
+        groove_factor *= groove_factor
+
+        # Per-stone height variation (subtle — 0.15 multiplier)
+        n = mathnoise.noise(Vector((ix * 1.53, iy * 2.07, 2.5)))
+
+        v.co.z += (-groove_factor + n * 0.15 * (1.0 - groove_factor)) * disp
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1279,7 @@ def apply_path(obj, settings_outdoor, settings_tile):
 
     print_scale = settings_tile.print_scale
     path_half_w = m(settings_outdoor.path_width, print_scale) / 2.0
+    depression = m(settings_outdoor.path_depth, print_scale)
     blend_zone = path_half_w * 0.5  # 50% of path width for gradual transition
     total_half_w = path_half_w + blend_zone
 
@@ -1140,21 +1299,563 @@ def apply_path(obj, settings_outdoor, settings_tile):
 
     avg_height = sum(core_heights) / len(core_heights)
 
-    # Pass 2: flatten using cached distances
+    # Pass 2: flatten and optionally depress using cached distances
     for v in bm.verts:
         dist = vert_dists.get(v.index)
         if dist is None:
             continue
 
         if dist <= path_half_w:
-            # Core: 80% average + 20% original
-            v.co.z = avg_height * 0.8 + v.co.z * 0.2
+            # Core: 80% average + 20% original, then depress
+            v.co.z = avg_height * 0.8 + v.co.z * 0.2 - depression
         elif dist <= total_half_w:
             # Blend zone: cosine transition
             blend_t = (dist - path_half_w) / blend_zone  # 0..1
             blend_factor = 0.5 * (1.0 + math.cos(blend_t * math.pi))  # 1..0
-            target = avg_height * 0.8 + v.co.z * 0.2
+            target = avg_height * 0.8 + v.co.z * 0.2 - depression
             v.co.z = v.co.z + (target - v.co.z) * blend_factor
+
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+
+# ---------------------------------------------------------------------------
+# Ridge line
+# ---------------------------------------------------------------------------
+
+def apply_ridge_line(obj, settings_outdoor, settings_tile):
+    """Raise a ridge along a user-defined curve centerline.
+
+    Cosine cross-section profile that adds height. Mirrors river channel
+    but is additive instead of subtractive.
+
+    Args:
+        obj: Blender mesh object
+        settings_outdoor: TILEFORGE_PG_OutdoorSettings
+        settings_tile: TILEFORGE_PG_TileSettings
+    """
+    if not settings_outdoor.add_ridge:
+        return
+    if settings_outdoor.ridge_curve is None:
+        return
+
+    polyline = _evaluate_curve_to_polyline(settings_outdoor.ridge_curve)
+    if len(polyline) < 2:
+        return
+
+    mat_inv = obj.matrix_world.inverted()
+    polyline = [mat_inv @ p for p in polyline]
+
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+
+    print_scale = settings_tile.print_scale
+    ridge_half_w = m(settings_outdoor.ridge_width, print_scale) / 2.0
+    height = m(settings_outdoor.ridge_height, print_scale)
+
+    for v in bm.verts:
+        dist, _, _ = _closest_point_on_polyline(v.co, polyline)
+        if dist < ridge_half_w:
+            t = dist / ridge_half_w  # 0 at center, 1 at edge
+            raise_amount = height * 0.5 * (1.0 + math.cos(t * math.pi))
+            v.co.z += raise_amount
+
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+
+# ---------------------------------------------------------------------------
+# Cliff / escarpment
+# ---------------------------------------------------------------------------
+
+def apply_cliff(obj, settings_outdoor, settings_tile):
+    """Apply a cliff drop-off along a user-defined curve.
+
+    Uses signed distance from the curve with a smoothstep transition.
+    Left side of the curve (facing its direction) is the high side,
+    right side drops by cliff_height.
+
+    Args:
+        obj: Blender mesh object
+        settings_outdoor: TILEFORGE_PG_OutdoorSettings
+        settings_tile: TILEFORGE_PG_TileSettings
+    """
+    if not settings_outdoor.add_cliff:
+        return
+    if settings_outdoor.cliff_curve is None:
+        return
+
+    polyline = _evaluate_curve_to_polyline(settings_outdoor.cliff_curve)
+    if len(polyline) < 2:
+        return
+
+    mat_inv = obj.matrix_world.inverted()
+    polyline = [mat_inv @ p for p in polyline]
+
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+
+    ps = settings_tile.print_scale
+    cliff_h = m(settings_outdoor.cliff_height, ps)
+    steepness = settings_outdoor.cliff_steepness
+    # Transition width: steepness=1 gives near-vertical, 0 gives gradual slope
+    tw = m(0.5, ps) * (1.0 - steepness * 0.95)
+
+    for v in bm.verts:
+        dist, closest, tangent = _closest_point_on_polyline(v.co, polyline)
+
+        # Signed distance via 2D cross product
+        # positive = left of curve direction = high side
+        signed_dist = (tangent.x * (v.co.y - closest.y)
+                       - tangent.y * (v.co.x - closest.x))
+
+        if signed_dist < -tw:
+            # Fully on low side — full drop
+            v.co.z -= cliff_h
+        elif signed_dist < tw:
+            # Transition zone — smoothstep blend
+            t = (signed_dist + tw) / (2.0 * tw)  # 0 (low) .. 1 (high)
+            # Smoothstep: 3t^2 - 2t^3
+            smooth = 3.0 * t * t - 2.0 * t * t * t
+            v.co.z -= cliff_h * (1.0 - smooth)
+        # else: high side, no change
+
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+
+# ---------------------------------------------------------------------------
+# Road network (A* pathfinding)
+# ---------------------------------------------------------------------------
+
+def _world_to_grid(wx, wy, half_x, half_y, grid_size):
+    """World XY (local space) -> (row, col) grid indices, clamped."""
+    u = (wx + half_x) / (2.0 * half_x) if half_x > 0 else 0.5
+    v = (wy + half_y) / (2.0 * half_y) if half_y > 0 else 0.5
+    col = max(0, min(grid_size - 1, round(u * (grid_size - 1))))
+    row = max(0, min(grid_size - 1, round(v * (grid_size - 1))))
+    return row, col
+
+
+def _grid_to_world(row, col, half_x, half_y, grid_size):
+    """Grid (row, col) -> (world_x, world_y) in local space."""
+    u = col / max(grid_size - 1, 1)
+    v = row / max(grid_size - 1, 1)
+    wx = -half_x + u * 2.0 * half_x
+    wy = -half_y + v * 2.0 * half_y
+    return wx, wy
+
+
+def _astar_height_grid(grid, grid_size, start_rc, end_rc, cell_size,
+                       slope_weight):
+    """A* on height grid with slope-aware cost.
+
+    Uses 8-connected neighbors. Cost per step includes euclidean distance
+    weighted by slope penalty.
+
+    Args:
+        grid: 2D list [row][col] of Z heights
+        grid_size: Number of cells per axis
+        start_rc: (row, col) start
+        end_rc: (row, col) end
+        cell_size: World-space distance between adjacent grid cells
+        slope_weight: How strongly to penalize slopes (0=ignore, 20=strong)
+
+    Returns:
+        List of (row, col) from start to end, or [] if unreachable.
+    """
+    import heapq
+
+    sr, sc = start_rc
+    er, ec = end_rc
+
+    # Chebyshev distance heuristic (admissible for 8-connected)
+    def heuristic(r, c):
+        dr = abs(r - er)
+        dc = abs(c - ec)
+        return max(dr, dc) + (math.sqrt(2) - 1) * min(dr, dc)
+
+    SQRT2 = math.sqrt(2)
+    # 8 directions: (dr, dc, euclidean_dist)
+    neighbors = [
+        (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+        (-1, -1, SQRT2), (-1, 1, SQRT2), (1, -1, SQRT2), (1, 1, SQRT2),
+    ]
+
+    open_set = [(heuristic(sr, sc), 0.0, sr, sc)]
+    g_cost = {(sr, sc): 0.0}
+    came_from = {}
+
+    while open_set:
+        _, g, r, c = heapq.heappop(open_set)
+
+        if (r, c) == (er, ec):
+            # Reconstruct path
+            path = [(er, ec)]
+            while (r, c) != (sr, sc):
+                r, c = came_from[(r, c)]
+                path.append((r, c))
+            path.reverse()
+            return path
+
+        if g > g_cost.get((r, c), float('inf')):
+            continue
+
+        hz = grid[r][c]
+
+        for dr, dc, base_dist in neighbors:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < grid_size and 0 <= nc < grid_size:
+                nz = grid[nr][nc]
+                dz = abs(nz - hz)
+                # Cost: distance * (1 + slope_weight * slope)
+                slope = dz / (cell_size * base_dist) if cell_size > 0 else 0
+                step_cost = base_dist * (1.0 + slope_weight * slope)
+                new_g = g + step_cost
+
+                if new_g < g_cost.get((nr, nc), float('inf')):
+                    g_cost[(nr, nc)] = new_g
+                    f = new_g + heuristic(nr, nc)
+                    heapq.heappush(open_set, (f, new_g, nr, nc))
+                    came_from[(nr, nc)] = (r, c)
+
+    return []  # Unreachable
+
+
+def _smooth_grid_path(path_rc, grid, grid_size, half_x, half_y, passes):
+    """Grid path -> smooth world-space polyline via Laplacian smoothing.
+
+    Args:
+        path_rc: List of (row, col) grid coordinates
+        grid: 2D height grid
+        grid_size: Grid dimension
+        half_x, half_y: Half terrain extent in local space
+        passes: Number of Laplacian smoothing iterations
+
+    Returns:
+        List of Vector(x, y, z) in terrain local space.
+    """
+    if len(path_rc) < 2:
+        return []
+
+    # Convert to world-space points with height
+    points = []
+    for r, c in path_rc:
+        wx, wy = _grid_to_world(r, c, half_x, half_y, grid_size)
+        wz = _bilinear_height(grid, grid_size, c, r)
+        points.append(Vector((wx, wy, wz)))
+
+    if len(points) < 3:
+        return points
+
+    # Remove near-collinear points (angle threshold 5 degrees)
+    threshold = math.cos(math.radians(5))  # cos(5°) — nearly straight
+    filtered = [points[0]]
+    for i in range(1, len(points) - 1):
+        d1 = (points[i] - points[i - 1]).normalized()
+        d2 = (points[i + 1] - points[i]).normalized()
+        if d1.length > 0 and d2.length > 0:
+            dot = d1.dot(d2)
+            if dot < threshold:  # Significant bend — keep it
+                filtered.append(points[i])
+        else:
+            filtered.append(points[i])
+    filtered.append(points[-1])
+    points = filtered
+
+    if len(points) < 3:
+        return points
+
+    # Laplacian smoothing (XY only, endpoints fixed)
+    for _ in range(passes):
+        new_pts = [points[0]]
+        for i in range(1, len(points) - 1):
+            nx = 0.5 * points[i].x + 0.25 * (points[i - 1].x + points[i + 1].x)
+            ny = 0.5 * points[i].y + 0.25 * (points[i - 1].y + points[i + 1].y)
+            new_pts.append(Vector((nx, ny, points[i].z)))
+        new_pts.append(points[-1])
+        points = new_pts
+
+    # Resample at uniform spacing (~cell_size)
+    cell_w = (2.0 * half_x) / max(grid_size - 1, 1)
+    spacing = cell_w
+    resampled = [points[0]]
+    accum = 0.0
+    for i in range(1, len(points)):
+        seg = points[i] - points[i - 1]
+        seg_len = seg.length
+        if seg_len < 1e-8:
+            continue
+        accum += seg_len
+        while accum >= spacing:
+            accum -= spacing
+            t = 1.0 - accum / seg_len if seg_len > 0 else 1.0
+            p = points[i - 1].lerp(points[i], t)
+            resampled.append(p)
+    # Always include the last point
+    if (resampled[-1] - points[-1]).length > spacing * 0.1:
+        resampled.append(points[-1])
+
+    # Re-lookup Z from height grid for each resampled point
+    for p in resampled:
+        u = (p.x + half_x) / (2.0 * half_x) if half_x > 0 else 0.5
+        v = (p.y + half_y) / (2.0 * half_y) if half_y > 0 else 0.5
+        gx = max(0.0, min(float(grid_size - 1), u * (grid_size - 1)))
+        gy = max(0.0, min(float(grid_size - 1), v * (grid_size - 1)))
+        p.z = _bilinear_height(grid, grid_size, gx, gy)
+
+    return resampled
+
+
+def _create_road_curve(name, points, collection):
+    """Create a POLY curve object from world-space Vector points.
+
+    Args:
+        name: Object name (will be prefixed with TF_Road_)
+        points: List of Vector(x, y, z) positions
+        collection: Blender collection to link to
+
+    Returns:
+        The created curve bpy.types.Object.
+    """
+    full_name = f"TF_Road_{name}"
+    curve_data = bpy.data.curves.new(full_name, type='CURVE')
+    curve_data.dimensions = '3D'
+
+    spline = curve_data.splines.new('POLY')
+    spline.points.add(len(points) - 1)  # spline starts with 1 point
+    for i, pt in enumerate(points):
+        spline.points[i].co = (pt.x, pt.y, pt.z, 1.0)
+
+    obj = bpy.data.objects.new(full_name, curve_data)
+    collection.objects.link(obj)
+
+    # Visual settings
+    curve_data.bevel_depth = 0.005
+    curve_data.use_fill_caps = True
+
+    return obj
+
+
+def apply_road_network(obj, settings_outdoor, settings_tile):
+    """Generate and flatten a procedural road network using A* pathfinding.
+
+    For each enabled road segment with valid waypoints:
+    1. Transform waypoint positions to grid coordinates
+    2. Run A* pathfinding on the height grid
+    3. Smooth the resulting path
+    4. Optionally create a curve object
+    5. Flatten terrain along all road polylines in one pass
+
+    Args:
+        obj: Blender mesh object (terrain)
+        settings_outdoor: TILEFORGE_PG_OutdoorSettings
+        settings_tile: TILEFORGE_PG_TileSettings
+    """
+    if not settings_outdoor.add_road_network:
+        return
+
+    # Collect enabled segments with valid waypoints
+    segments = []
+    for seg in settings_outdoor.road_segments:
+        if seg.enabled and seg.waypoint_start is not None and seg.waypoint_end is not None:
+            segments.append(seg)
+
+    if not segments:
+        return
+
+    print_scale = settings_tile.print_scale
+    grid_size = settings_outdoor.subdivisions + 1
+
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+
+    grid, index_map = mesh_to_height_grid(bm, grid_size)
+
+    half_x = m(settings_tile.map_width, print_scale) / 2.0
+    half_y = m(settings_tile.map_depth, print_scale) / 2.0
+    cell_x = (2.0 * half_x) / max(settings_outdoor.subdivisions, 1)
+    cell_y = (2.0 * half_y) / max(settings_outdoor.subdivisions, 1)
+    cell_size = (cell_x + cell_y) * 0.5
+
+    mat_inv = obj.matrix_world.inverted()
+
+    # Run pathfinding and build polylines
+    road_polylines = []
+    for seg in segments:
+        # Transform waypoints to local space
+        start_local = mat_inv @ seg.waypoint_start.matrix_world.translation
+        end_local = mat_inv @ seg.waypoint_end.matrix_world.translation
+
+        start_rc = _world_to_grid(start_local.x, start_local.y,
+                                  half_x, half_y, grid_size)
+        end_rc = _world_to_grid(end_local.x, end_local.y,
+                                half_x, half_y, grid_size)
+
+        path_rc = _astar_height_grid(
+            grid, grid_size, start_rc, end_rc, cell_size,
+            settings_outdoor.road_slope_weight,
+        )
+        if not path_rc:
+            continue
+
+        polyline = _smooth_grid_path(
+            path_rc, grid, grid_size, half_x, half_y,
+            settings_outdoor.road_smoothing,
+        )
+        if len(polyline) < 2:
+            continue
+
+        road_polylines.append((seg, polyline))
+
+    if not road_polylines:
+        bm.free()
+        return
+
+    # Compute per-road average height (for flattening target)
+    road_infos = []
+    for seg, polyline in road_polylines:
+        avg_z = sum(p.z for p in polyline) / len(polyline)
+        road_infos.append((polyline, avg_z))
+
+    # Optionally create curve objects
+    if settings_outdoor.road_create_curve:
+        # Remove old road curves first
+        old_curves = [o for o in bpy.data.objects if o.name.startswith("TF_Road_")]
+        for o in old_curves:
+            curve_data = o.data
+            bpy.data.objects.remove(o, do_unlink=True)
+            if curve_data and curve_data.users == 0:
+                bpy.data.curves.remove(curve_data)
+
+        collection = obj.users_collection[0] if obj.users_collection else bpy.context.collection
+        for seg, polyline in road_polylines:
+            # Transform polyline back to world space for the curve
+            world_pts = [obj.matrix_world @ p for p in polyline]
+            _create_road_curve(seg.segment_name, world_pts, collection)
+
+    # Flatten terrain along ALL road polylines in one pass
+    path_half_w = m(settings_outdoor.road_width, print_scale) / 2.0
+    depression = m(settings_outdoor.road_depth, print_scale)
+    blend_zone = path_half_w * 0.5
+    total_half_w = path_half_w + blend_zone
+
+    bm.verts.ensure_lookup_table()
+    for v in bm.verts:
+        best_dist = float('inf')
+        best_road_idx = -1
+
+        # Find closest road to this vertex
+        for ri, (polyline, avg_z) in enumerate(road_infos):
+            dist, _, _ = _closest_point_on_polyline(v.co, polyline)
+            if dist < best_dist:
+                best_dist = dist
+                best_road_idx = ri
+
+        if best_road_idx < 0 or best_dist > total_half_w:
+            continue
+
+        _, avg_z = road_infos[best_road_idx]
+
+        if best_dist <= path_half_w:
+            # Core zone: flatten to average - depression
+            v.co.z = avg_z * 0.8 + v.co.z * 0.2 - depression
+        else:
+            # Blend zone: cosine taper
+            blend_t = (best_dist - path_half_w) / blend_zone
+            blend_factor = 0.5 * (1.0 + math.cos(blend_t * math.pi))
+            target = avg_z * 0.8 + v.co.z * 0.2 - depression
+            v.co.z = v.co.z + (target - v.co.z) * blend_factor
+
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+
+def apply_painted_road(obj, settings_outdoor, settings_tile):
+    """Flatten terrain along a painted road alpha mask.
+
+    Two-pass: collect average height of core painted vertices (alpha >= 0.5),
+    then blend each painted vertex toward that average using alpha as factor.
+
+    Args:
+        obj: Blender mesh object (terrain)
+        settings_outdoor: TILEFORGE_PG_OutdoorSettings
+        settings_tile: TILEFORGE_PG_TileSettings
+    """
+    if not settings_outdoor.add_painted_road:
+        return
+
+    mask_img = bpy.data.images.get("TF_RoadPaint_Mask")
+    if not mask_img:
+        return
+
+    pixels = list(mask_img.pixels)
+    img_w, img_h = mask_img.size
+
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+
+    print_scale = settings_tile.print_scale
+    half_x = m(settings_tile.map_width, print_scale) / 2.0
+    half_y = m(settings_tile.map_depth, print_scale) / 2.0
+    depression = m(settings_outdoor.road_paint_depth, print_scale)
+    blend_sharpness = settings_outdoor.road_paint_blend
+
+    # Pass 1: sample alpha for each vertex, collect core heights
+    vert_alpha = {}
+    core_z_sum = 0.0
+    core_z_count = 0
+
+    bm.verts.ensure_lookup_table()
+    for v in bm.verts:
+        u = (v.co.x + half_x) / (2.0 * half_x) if half_x > 0 else 0.5
+        vv = (v.co.y + half_y) / (2.0 * half_y) if half_y > 0 else 0.5
+        u = max(0.0, min(1.0, u))
+        vv = max(0.0, min(1.0, vv))
+
+        alpha = _sample_bilinear(pixels, img_w, img_h, u, vv, channel=3)
+        if alpha > 0.01:
+            vert_alpha[v.index] = alpha
+            if alpha >= 0.5:
+                core_z_sum += v.co.z
+                core_z_count += 1
+
+    if not vert_alpha:
+        bm.free()
+        return
+
+    if core_z_count > 0:
+        avg_height = core_z_sum / core_z_count
+    else:
+        # Fallback: average all painted vertices if none exceed the core threshold
+        avg_height = sum(
+            v.co.z for v in bm.verts if v.index in vert_alpha
+        ) / len(vert_alpha)
+
+    # Pass 2: blend each painted vertex toward the target
+    for v in bm.verts:
+        alpha = vert_alpha.get(v.index)
+        if alpha is None:
+            continue
+
+        # Apply blend sharpness curve: remap alpha
+        # blend=0 → hard edges (step at 0.5), blend=1 → smooth (linear alpha)
+        if blend_sharpness < 1.0:
+            # Power curve to sharpen edges
+            power = 1.0 + (1.0 - blend_sharpness) * 4.0  # range 1..5
+            alpha = alpha ** (1.0 / power) if alpha >= 0.5 else 1.0 - (1.0 - alpha) ** (1.0 / power)
+            alpha = max(0.0, min(1.0, alpha))
+
+        target = avg_height * 0.8 + v.co.z * 0.2 - depression
+        v.co.z = v.co.z + (target - v.co.z) * alpha
 
     bm.to_mesh(mesh)
     bm.free()
@@ -1164,6 +1865,50 @@ def apply_path(obj, settings_outdoor, settings_tile):
 # ---------------------------------------------------------------------------
 # Heightmap-based terrain
 # ---------------------------------------------------------------------------
+
+def _sample_bilinear(pixels, w, h, u, v, channel=0):
+    """Sample a channel from a flat RGBA pixel array with bilinear interpolation.
+
+    Args:
+        pixels: Flat list of RGBA floats (length w*h*4)
+        w, h: Image dimensions in pixels
+        u, v: Texture coordinates in 0..1 range
+        channel: RGBA channel index (0=R, 1=G, 2=B, 3=A)
+
+    Returns:
+        Interpolated channel value (0..1).
+    """
+    # Continuous pixel coordinates
+    fx = u * (w - 1)
+    fy = v * (h - 1)
+
+    # Integer corners
+    x0 = int(fx)
+    y0 = int(fy)
+    x1 = min(x0 + 1, w - 1)
+    y1 = min(y0 + 1, h - 1)
+
+    # Fractional offsets
+    tx = fx - x0
+    ty = fy - y0
+
+    # Sample specified channel at four corners
+    num_px = w * h * 4
+    def _c(x, y):
+        idx = (y * w + x) * 4 + channel
+        return pixels[idx] if idx < num_px else 0.0
+
+    c00 = _c(x0, y0)
+    c10 = _c(x1, y0)
+    c01 = _c(x0, y1)
+    c11 = _c(x1, y1)
+
+    # Bilinear blend
+    top = c00 + (c10 - c00) * tx
+    bot = c01 + (c11 - c01) * tx
+    val = top + (bot - top) * ty
+    return max(0.0, min(1.0, val))
+
 
 def apply_heightmap(obj, image_path, settings_outdoor, settings_tile):
     """
@@ -1208,16 +1953,19 @@ def apply_heightmap(obj, image_path, settings_outdoor, settings_tile):
         u = cl + u_raw * (1.0 - cl - cr)
         v_coord = cb + v_raw * (1.0 - cb - ct)
 
-        # Pixel coordinates
-        px = int(u * (w - 1))
-        py = int(v_coord * (h - 1))
-        idx = (py * w + px) * 4  # RGBA
-
-        # Use red channel (grayscale: R=G=B)
-        brightness = pixels[idx] if idx < len(pixels) else 0.0
-        brightness = max(0.0, min(1.0, brightness))
+        # Bilinear interpolation of red channel
+        brightness = _sample_bilinear(pixels, w, h, u, v_coord)
 
         v.co.z = height_offset + brightness * height_range
+
+    # Smooth jagged edges (reuses color-map smoothing pipeline)
+    if settings_outdoor.map_smoothing > 0:
+        edge_strength = settings_outdoor.edge_preserve_strength
+        if edge_strength > 0.0 and height_range > 1e-9:
+            sigma = height_range * 0.5 * (1.0 - edge_strength * 0.95)
+            _smooth_z_bilateral(bm, settings_outdoor.map_smoothing, sigma)
+        else:
+            _smooth_z(bm, settings_outdoor.map_smoothing)
 
     bm.to_mesh(mesh)
     bm.free()
@@ -1785,11 +2533,11 @@ def _add_peg(obj, position_xy, radius, height, axis='X'):
     if axis == 'X':
         for v in bm.verts:
             x, y, z = v.co
-            v.co = Vector((z + position_xy[0], position_xy[1], 0))
+            v.co = Vector((z + position_xy[0], y + position_xy[1], x))
     else:
         for v in bm.verts:
             x, y, z = v.co
-            v.co = Vector((position_xy[0], z + position_xy[1], 0))
+            v.co = Vector((x + position_xy[0], z + position_xy[1], y))
 
     # Shift Z to base level
     min_z = min(v.co.z for v in bm.verts)
@@ -1827,11 +2575,11 @@ def _add_slot(obj, position_xy, radius, depth, axis='X'):
     if axis == 'X':
         for v in bm.verts:
             x, y, z = v.co
-            v.co = Vector((z + position_xy[0], position_xy[1], 0))
+            v.co = Vector((z + position_xy[0], y + position_xy[1], x))
     else:
         for v in bm.verts:
             x, y, z = v.co
-            v.co = Vector((position_xy[0], z + position_xy[1], 0))
+            v.co = Vector((x + position_xy[0], z + position_xy[1], y))
 
     min_z = min(v.co.z for v in bm.verts)
     for v in bm.verts:

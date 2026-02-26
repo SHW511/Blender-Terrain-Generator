@@ -21,3 +21,4 @@ tags = [
 # We need file system access for STL export
 [permissions]
 files = "Export STL tile files to disk"
+network = "Send map images to AI services (OpenAI/Google Gemini) for heightmap generation"
