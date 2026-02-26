@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pages: write
+      id-token: write
 
     steps:
       - name: Checkout
@@ -28,9 +30,70 @@ jobs:
 
       - name: Create zip
         run: |
-          zip -r dnd_tile_forge-${{ steps.version.outputs.version }}.zip \
-            $(find . -name "*.py" -not -path "./.git/*") \
-            blender_manifest.toml
+          ZIP_NAME="dnd_tile_forge-${{ steps.version.outputs.version }}.zip"
+          zip -r "$ZIP_NAME" \
+            *.py \
+            blender_manifest.toml \
+            -x "__pycache__/*"
+
+      - name: Generate index.json
+        run: |
+          python3 << 'PYEOF'
+          import hashlib, json, os, tomllib
+
+          with open("blender_manifest.toml", "rb") as f:
+              manifest = tomllib.load(f)
+
+          version = manifest["version"]
+          zip_name = f"dnd_tile_forge-{version}.zip"
+
+          with open(zip_name, "rb") as f:
+              zip_bytes = f.read()
+          archive_size = len(zip_bytes)
+          archive_hash = "sha256:" + hashlib.sha256(zip_bytes).hexdigest()
+
+          entry = {
+              "schema_version": manifest["schema_version"],
+              "id": manifest["id"],
+              "version": version,
+              "name": manifest["name"],
+              "tagline": manifest["tagline"],
+              "maintainer": manifest["maintainer"],
+              "type": manifest["type"],
+              "license": manifest["license"],
+              "blender_version_min": manifest["blender_version_min"],
+              "tags": manifest["tags"],
+              "permissions": manifest.get("permissions", {}),
+              "archive_url": f"./{zip_name}",
+              "archive_size": archive_size,
+              "archive_hash": archive_hash,
+          }
+
+          index = {
+              "version": "v1",
+              "blocklist": [],
+              "data": [entry],
+          }
+
+          os.makedirs("pages", exist_ok=True)
+          with open("pages/index.json", "w") as f:
+              json.dump(index, f, indent=2)
+
+          # Copy zip into pages directory
+          import shutil
+          shutil.copy(zip_name, "pages/")
+
+          print(f"Built index.json for {manifest['name']} v{version}")
+          print(f"  archive_size: {archive_size}")
+          print(f"  archive_hash: {archive_hash}")
+          PYEOF
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./pages
+          force_orphan: true
 
       - name: Create release
         uses: softprops/action-gh-release@v2

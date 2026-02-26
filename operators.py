@@ -8,6 +8,7 @@ import bmesh
 import bpy
 from bpy.types import Operator
 
+from . import ai_api
 from . import mesh_gen
 from .mesh_gen import mm, m
 
@@ -28,108 +29,153 @@ class TILEFORGE_OT_GenerateTerrain(Operator):
         outdoor = tf.outdoor
         print_scale = tile.print_scale
 
+        if outdoor.is_road_painting:
+            self.report({'ERROR'}, "Exit road paint mode before generating")
+            return {'CANCELLED'}
+
         wm = context.window_manager
-        wm.progress_begin(0, 10)
+        wm.progress_begin(0, 14)
 
-        # Clean up previous preview
-        _remove_objects_by_prefix("TF_Preview")
+        try:
+            # Clean up previous preview
+            _remove_objects_by_prefix("TF_Preview")
 
-        total_x = tile.map_width
-        total_y = tile.map_depth
+            total_x = tile.map_width
+            total_y = tile.map_depth
 
-        obj, mesh = mesh_gen.create_base_grid(
-            "TF_Preview_Terrain",
-            total_x,
-            total_y,
-            outdoor.subdivisions,
-            print_scale,
-        )
-
-        # Link to scene
-        context.collection.objects.link(obj)
-        context.view_layer.objects.active = obj
-        obj.select_set(True)
-        wm.progress_update(1)
-
-        # Apply terrain
-        if outdoor.terrain_type == "CUSTOM" and outdoor.heightmap_image:
-            mesh_gen.apply_heightmap(obj, outdoor.heightmap_image, outdoor, tile)
-        elif outdoor.terrain_type == "MAP_IMAGE" and outdoor.heightmap_image:
-            mesh_gen.apply_color_map(obj, outdoor.heightmap_image, outdoor, tile)
-            if outdoor.enable_terracing:
-                mesh_gen.apply_terracing_post(obj, outdoor, tile)
-        else:
-            mesh_gen.apply_procedural_noise(obj, outdoor, tile)
-        wm.progress_update(2)
-
-        # Noise layers (procedural modes only)
-        is_image_mode = outdoor.terrain_type in ("CUSTOM", "MAP_IMAGE")
-        if not is_image_mode and outdoor.enable_noise_layers:
-            mesh_gen.apply_noise_layers(obj, outdoor, tile)
-        wm.progress_update(3)
-
-        # Erosion (operates on height grid for performance)
-        if outdoor.enable_hydraulic_erosion or outdoor.enable_thermal_erosion:
-            mesh_data = obj.data
-            bm = bmesh.new()
-            bm.from_mesh(mesh_data)
-
-            grid_size = outdoor.subdivisions + 1
-            cell_x = m(tile.map_width, print_scale) / max(outdoor.subdivisions, 1)
-            cell_y = m(tile.map_depth, print_scale) / max(outdoor.subdivisions, 1)
-            cell_size = (cell_x + cell_y) * 0.5
-            grid, index_map = mesh_gen.mesh_to_height_grid(bm, grid_size)
-
-            if outdoor.enable_hydraulic_erosion:
-                mesh_gen.apply_hydraulic_erosion(grid, grid_size, outdoor, cell_size)
-
-            if outdoor.enable_thermal_erosion:
-                mesh_gen.apply_thermal_erosion(grid, grid_size, outdoor, cell_size)
-
-            mesh_gen.height_grid_to_mesh(bm, grid, grid_size, index_map)
-            bm.to_mesh(mesh_data)
-            bm.free()
-            mesh_data.update()
-        wm.progress_update(4)
-
-        # Slope clamping (final safety pass — after erosion)
-        if outdoor.enable_slope_clamp:
-            mesh_gen.clamp_slopes(obj, outdoor.max_slope_angle)
-        wm.progress_update(5)
-
-        # River channel (after erosion/clamping — intentional carving)
-        if outdoor.add_river and outdoor.river_curve is None:
-            self.report({'WARNING'}, "River enabled but no curve assigned — skipping")
-        mesh_gen.apply_river_channel(obj, outdoor, tile)
-        wm.progress_update(6)
-
-        # Path / road (after erosion — flattens to average height)
-        if outdoor.add_path and outdoor.path_curve is None:
-            self.report({'WARNING'}, "Path enabled but no curve assigned — skipping")
-        mesh_gen.apply_path(obj, outdoor, tile)
-        wm.progress_update(7)
-
-        # Ground texture (last detail pass — micro-displacement)
-        if outdoor.floor_texture != 'NONE':
-            mesh_gen.apply_ground_texture(
-                obj, outdoor.floor_texture, outdoor.texture_strength, tile
+            obj, mesh = mesh_gen.create_base_grid(
+                "TF_Preview_Terrain",
+                total_x,
+                total_y,
+                outdoor.subdivisions,
+                print_scale,
             )
-        wm.progress_update(8)
 
-        # Add solid base
-        mesh_gen.add_solid_base(obj, tile.base_height)
-        wm.progress_update(9)
+            # Link to scene
+            context.collection.objects.link(obj)
+            context.view_layer.objects.active = obj
+            obj.select_set(True)
+            wm.progress_update(1)
 
-        # Smooth shading for higher quality terrain surface
-        mesh_gen.apply_shade_smooth(obj)
+            # Apply terrain
+            if outdoor.terrain_type == "CUSTOM" and outdoor.heightmap_image:
+                mesh_gen.apply_heightmap(obj, outdoor.heightmap_image, outdoor, tile)
+            elif outdoor.terrain_type == "MAP_IMAGE" and outdoor.heightmap_image:
+                mesh_gen.apply_color_map(obj, outdoor.heightmap_image, outdoor, tile)
+                if outdoor.enable_terracing:
+                    mesh_gen.apply_terracing_post(obj, outdoor, tile)
+            else:
+                mesh_gen.apply_procedural_noise(obj, outdoor, tile)
+            wm.progress_update(2)
 
-        # Assign terrain material
-        mesh_gen.assign_terrain_material(obj)
-        wm.progress_update(10)
+            # Noise layers (procedural modes only)
+            is_image_mode = outdoor.terrain_type in ("CUSTOM", "MAP_IMAGE")
+            if not is_image_mode and outdoor.enable_noise_layers:
+                mesh_gen.apply_noise_layers(obj, outdoor, tile)
+            wm.progress_update(3)
 
-        wm.progress_end()
-        self.report({'INFO'}, f"Generated terrain: {total_x:.1f} x {total_y:.1f} m")
-        return {'FINISHED'}
+            # Erosion (operates on height grid for performance)
+            if outdoor.enable_hydraulic_erosion or outdoor.enable_thermal_erosion:
+                mesh_data = obj.data
+                bm = bmesh.new()
+                bm.from_mesh(mesh_data)
+
+                grid_size = outdoor.subdivisions + 1
+                cell_x = m(tile.map_width, print_scale) / max(outdoor.subdivisions, 1)
+                cell_y = m(tile.map_depth, print_scale) / max(outdoor.subdivisions, 1)
+                cell_size = (cell_x + cell_y) * 0.5
+                grid, index_map = mesh_gen.mesh_to_height_grid(bm, grid_size)
+
+                if outdoor.enable_hydraulic_erosion:
+                    mesh_gen.apply_hydraulic_erosion(grid, grid_size, outdoor, cell_size)
+
+                if outdoor.enable_thermal_erosion:
+                    mesh_gen.apply_thermal_erosion(grid, grid_size, outdoor, cell_size)
+
+                mesh_gen.height_grid_to_mesh(bm, grid, grid_size, index_map)
+                bm.to_mesh(mesh_data)
+                bm.free()
+                mesh_data.update()
+            wm.progress_update(4)
+
+            # Slope clamping (final safety pass — after erosion)
+            if outdoor.enable_slope_clamp:
+                mesh_gen.clamp_slopes(obj, outdoor.max_slope_angle)
+            wm.progress_update(5)
+
+            # Cliff (large-scale terrain reshaping — before additive features)
+            if outdoor.add_cliff and outdoor.cliff_curve is None:
+                self.report({'WARNING'}, "Cliff enabled but no curve assigned — skipping")
+            mesh_gen.apply_cliff(obj, outdoor, tile)
+            wm.progress_update(6)
+
+            # Ridge line (additive feature)
+            if outdoor.add_ridge and outdoor.ridge_curve is None:
+                self.report({'WARNING'}, "Ridge enabled but no curve assigned — skipping")
+            mesh_gen.apply_ridge_line(obj, outdoor, tile)
+            wm.progress_update(7)
+
+            # River channel (after erosion/clamping — intentional carving)
+            if outdoor.add_river and outdoor.river_curve is None:
+                self.report({'WARNING'}, "River enabled but no curve assigned — skipping")
+            mesh_gen.apply_river_channel(obj, outdoor, tile)
+            wm.progress_update(8)
+
+            # Path / road (after erosion — flattens to average height)
+            if outdoor.add_path and outdoor.path_curve is None:
+                self.report({'WARNING'}, "Path enabled but no curve assigned — skipping")
+            mesh_gen.apply_path(obj, outdoor, tile)
+            wm.progress_update(9)
+
+            # Procedural road network (A* pathfinding between waypoints)
+            if outdoor.add_road_network:
+                for seg in outdoor.road_segments:
+                    if seg.enabled and (seg.waypoint_start is None or seg.waypoint_end is None):
+                        self.report({'WARNING'}, f"Road '{seg.segment_name}': missing waypoints — skipping")
+                mesh_gen.apply_road_network(obj, outdoor, tile)
+            wm.progress_update(10)
+
+            # Painted road mask (flatten terrain along painted strokes)
+            mesh_gen.apply_painted_road(obj, outdoor, tile)
+            wm.progress_update(11)
+
+            # Ground texture (last detail pass — micro-displacement)
+            road_tex_kwargs = {}
+            if (outdoor.add_painted_road
+                    and outdoor.road_paint_texture != 'NONE'):
+                mask_img = bpy.data.images.get("TF_RoadPaint_Mask")
+                if mask_img:
+                    road_tex_kwargs = {
+                        'road_mask_pixels': list(mask_img.pixels),
+                        'road_mask_w': mask_img.size[0],
+                        'road_mask_h': mask_img.size[1],
+                        'road_texture': outdoor.road_paint_texture,
+                        'road_texture_strength': outdoor.road_paint_texture_strength,
+                        'road_texture_scale': outdoor.road_paint_texture_scale,
+                        'road_cobble_density': outdoor.road_paint_cobble_density,
+                    }
+            if outdoor.floor_texture != 'NONE' or road_tex_kwargs:
+                mesh_gen.apply_ground_texture(
+                    obj, outdoor.floor_texture, outdoor.texture_strength, tile,
+                    **road_tex_kwargs,
+                )
+            wm.progress_update(12)
+
+            # Add solid base
+            mesh_gen.add_solid_base(obj, tile.base_height)
+            wm.progress_update(13)
+
+            # Smooth shading for higher quality terrain surface
+            mesh_gen.apply_shade_smooth(obj)
+
+            # Assign terrain material
+            mesh_gen.assign_terrain_material(obj)
+            wm.progress_update(14)
+
+            self.report({'INFO'}, f"Generated terrain: {total_x:.1f} x {total_y:.1f} m")
+            return {'FINISHED'}
+        finally:
+            wm.progress_end()
 
 
 class TILEFORGE_OT_GenerateDungeon(Operator):
@@ -516,6 +562,44 @@ class TILEFORGE_OT_RemoveColorZone(Operator):
 # Heightmap painting
 # ---------------------------------------------------------------------------
 
+class TILEFORGE_OT_AddRoadSegment(Operator):
+    """Add a road segment to the road network"""
+    bl_idname = "tileforge.add_road_segment"
+    bl_label = "Add Road Segment"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+        if len(outdoor.road_segments) >= 8:
+            self.report({'WARNING'}, "Maximum 8 road segments allowed")
+            return {'CANCELLED'}
+        seg = outdoor.road_segments.add()
+        seg.segment_name = f"Road {len(outdoor.road_segments)}"
+        outdoor.active_road_segment_index = len(outdoor.road_segments) - 1
+        return {'FINISHED'}
+
+
+class TILEFORGE_OT_RemoveRoadSegment(Operator):
+    """Remove the active road segment"""
+    bl_idname = "tileforge.remove_road_segment"
+    bl_label = "Remove Road Segment"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+        idx = outdoor.active_road_segment_index
+        if idx < 0 or idx >= len(outdoor.road_segments):
+            self.report({'WARNING'}, "No road segment selected")
+            return {'CANCELLED'}
+        outdoor.road_segments.remove(idx)
+        outdoor.active_road_segment_index = min(idx, len(outdoor.road_segments) - 1)
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Heightmap painting
+# ---------------------------------------------------------------------------
+
 class TILEFORGE_OT_SetupHeightmapPaint(Operator):
     """Set up a textured plane for painting elevation zones over a reference map"""
     bl_idname = "tileforge.setup_heightmap_paint"
@@ -524,6 +608,10 @@ class TILEFORGE_OT_SetupHeightmapPaint(Operator):
 
     def execute(self, context):
         outdoor = context.scene.tile_forge.outdoor
+
+        if outdoor.is_road_painting:
+            self.report({'ERROR'}, "Exit road paint mode first")
+            return {'CANCELLED'}
 
         ref_path = bpy.path.abspath(outdoor.paint_reference_image)
         if not ref_path or not os.path.isfile(ref_path):
@@ -685,6 +773,10 @@ class TILEFORGE_OT_SetBrushHeight(Operator):
 
     _gray_values = {"SEA": 0.0, "LOW": 0.25, "MID": 0.5, "HIGH": 0.75, "PEAK": 1.0}
 
+    @classmethod
+    def poll(cls, context):
+        return context.scene.tile_forge.outdoor.is_painting
+
     def execute(self, context):
         # Ensure we're in texture paint mode
         if context.mode != 'PAINT_TEXTURE':
@@ -718,73 +810,82 @@ class TILEFORGE_OT_ApplyPaintedHeightmap(Operator):
     bl_label = "Apply Heightmap"
     bl_options = {'REGISTER', 'UNDO'}
 
+    @classmethod
+    def poll(cls, context):
+        return context.scene.tile_forge.outdoor.is_painting
+
     def execute(self, context):
         outdoor = context.scene.tile_forge.outdoor
 
-        # Exit paint mode
-        if context.mode == 'PAINT_TEXTURE':
-            bpy.ops.object.mode_set(mode='OBJECT')
+        try:
+            # Exit paint mode
+            if context.mode == 'PAINT_TEXTURE':
+                bpy.ops.object.mode_set(mode='OBJECT')
 
-        paint_img = bpy.data.images.get("TF_Paint_Heightmap")
-        if not paint_img:
-            self.report({'ERROR'}, "No painted heightmap found")
+            paint_img = bpy.data.images.get("TF_Paint_Heightmap")
+            if not paint_img:
+                self.report({'ERROR'}, "No painted heightmap found")
+                return {'CANCELLED'}
+
+            # Convert RGBA to grayscale PNG
+            w, h = paint_img.size
+            px = list(paint_img.pixels)  # flat RGBA
+            gray_pixels = [0.0] * (w * h * 4)
+
+            for i in range(w * h):
+                r = px[i * 4]
+                a = px[i * 4 + 3]
+                # Painted areas use their RGB value; unpainted (alpha=0) default to mid
+                g = r * a + 0.5 * (1.0 - a)
+                gray_pixels[i * 4]     = g
+                gray_pixels[i * 4 + 1] = g
+                gray_pixels[i * 4 + 2] = g
+                gray_pixels[i * 4 + 3] = 1.0
+
+            # Create output image
+            out_img = bpy.data.images.new(
+                "TF_Paint_Output", width=w, height=h,
+                alpha=False, float_buffer=False,
+            )
+            out_img.pixels[:] = gray_pixels
+
+            # Save next to the reference image
+            ref_path = bpy.path.abspath(outdoor.paint_reference_image)
+            out_dir = os.path.dirname(ref_path) if ref_path else ""
+            if not out_dir:
+                out_dir = bpy.path.abspath("//")
+            out_path = os.path.join(out_dir, "tileforge_painted_heightmap.png")
+
+            out_img.filepath_raw = out_path
+            out_img.file_format = 'PNG'
+            out_img.save()
+            bpy.data.images.remove(out_img)
+
+            # Set as custom heightmap
+            outdoor.heightmap_image = out_path
+            outdoor.terrain_type = "CUSTOM"
+
+            # Delete progress file — work is finalized
+            progress = _paint_progress_path(outdoor)
+            if progress and os.path.isfile(progress):
+                os.remove(progress)
+
+            # Clean up paint objects and images
+            _remove_objects_by_prefix("TF_Paint_")
+            mat = bpy.data.materials.get("TF_Paint_Material")
+            if mat:
+                bpy.data.materials.remove(mat)
+            paint_img = bpy.data.images.get("TF_Paint_Heightmap")
+            if paint_img:
+                bpy.data.images.remove(paint_img)
+
+            self.report({'INFO'}, f"Heightmap saved to {out_path}")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to apply painted heightmap: {e}")
             return {'CANCELLED'}
-
-        # Convert RGBA to grayscale PNG
-        w, h = paint_img.size
-        px = list(paint_img.pixels)  # flat RGBA
-        gray_pixels = [0.0] * (w * h * 4)
-
-        for i in range(w * h):
-            r = px[i * 4]
-            a = px[i * 4 + 3]
-            # Painted areas use their RGB value; unpainted (alpha=0) default to mid
-            g = r * a + 0.5 * (1.0 - a)
-            gray_pixels[i * 4]     = g
-            gray_pixels[i * 4 + 1] = g
-            gray_pixels[i * 4 + 2] = g
-            gray_pixels[i * 4 + 3] = 1.0
-
-        # Create output image
-        out_img = bpy.data.images.new(
-            "TF_Paint_Output", width=w, height=h,
-            alpha=False, float_buffer=False,
-        )
-        out_img.pixels[:] = gray_pixels
-
-        # Save next to the reference image
-        ref_path = bpy.path.abspath(outdoor.paint_reference_image)
-        out_dir = os.path.dirname(ref_path) if ref_path else ""
-        if not out_dir:
-            out_dir = bpy.path.abspath("//")
-        out_path = os.path.join(out_dir, "tileforge_painted_heightmap.png")
-
-        out_img.filepath_raw = out_path
-        out_img.file_format = 'PNG'
-        out_img.save()
-        bpy.data.images.remove(out_img)
-
-        # Set as custom heightmap
-        outdoor.heightmap_image = out_path
-        outdoor.terrain_type = "CUSTOM"
-
-        # Delete progress file — work is finalized
-        progress = _paint_progress_path(outdoor)
-        if progress and os.path.isfile(progress):
-            os.remove(progress)
-
-        # Clean up paint objects and images
-        _remove_objects_by_prefix("TF_Paint_")
-        mat = bpy.data.materials.get("TF_Paint_Material")
-        if mat:
-            bpy.data.materials.remove(mat)
-        paint_img = bpy.data.images.get("TF_Paint_Heightmap")
-        if paint_img:
-            bpy.data.images.remove(paint_img)
-
-        outdoor.is_painting = False
-        self.report({'INFO'}, f"Heightmap saved to {out_path}")
-        return {'FINISHED'}
+        finally:
+            outdoor.is_painting = False
 
 
 class TILEFORGE_OT_CancelPaintMode(Operator):
@@ -793,25 +894,34 @@ class TILEFORGE_OT_CancelPaintMode(Operator):
     bl_label = "Cancel"
     bl_options = {'REGISTER', 'UNDO'}
 
+    @classmethod
+    def poll(cls, context):
+        return context.scene.tile_forge.outdoor.is_painting
+
     def execute(self, context):
         outdoor = context.scene.tile_forge.outdoor
 
-        # Exit paint mode
-        if context.mode == 'PAINT_TEXTURE':
-            bpy.ops.object.mode_set(mode='OBJECT')
+        try:
+            # Exit paint mode
+            if context.mode == 'PAINT_TEXTURE':
+                bpy.ops.object.mode_set(mode='OBJECT')
 
-        # Remove paint objects
-        _remove_objects_by_prefix("TF_Paint_")
-        mat = bpy.data.materials.get("TF_Paint_Material")
-        if mat:
-            bpy.data.materials.remove(mat)
-        paint_img = bpy.data.images.get("TF_Paint_Heightmap")
-        if paint_img:
-            bpy.data.images.remove(paint_img)
+            # Remove paint objects
+            _remove_objects_by_prefix("TF_Paint_")
+            mat = bpy.data.materials.get("TF_Paint_Material")
+            if mat:
+                bpy.data.materials.remove(mat)
+            paint_img = bpy.data.images.get("TF_Paint_Heightmap")
+            if paint_img:
+                bpy.data.images.remove(paint_img)
 
-        outdoor.is_painting = False
-        self.report({'INFO'}, "Paint mode cancelled")
-        return {'FINISHED'}
+            self.report({'INFO'}, "Paint mode cancelled")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to cancel paint mode: {e}")
+            return {'CANCELLED'}
+        finally:
+            outdoor.is_painting = False
 
 
 class TILEFORGE_OT_SavePaintProgress(Operator):
@@ -819,6 +929,10 @@ class TILEFORGE_OT_SavePaintProgress(Operator):
     bl_idname = "tileforge.save_paint_progress"
     bl_label = "Save Progress"
     bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.tile_forge.outdoor.is_painting
 
     def execute(self, context):
         outdoor = context.scene.tile_forge.outdoor
@@ -842,6 +956,414 @@ class TILEFORGE_OT_SavePaintProgress(Operator):
 
 
 # ---------------------------------------------------------------------------
+# Painted road mask
+# ---------------------------------------------------------------------------
+
+class TILEFORGE_OT_SetupRoadPaint(Operator):
+    """Enter texture paint mode on the terrain to paint road paths"""
+    bl_idname = "tileforge.setup_road_paint"
+    bl_label = "Paint Roads"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        tf = context.scene.tile_forge
+        outdoor = tf.outdoor
+        tile = tf.tile
+
+        if outdoor.is_painting:
+            self.report({'ERROR'}, "Exit heightmap paint mode first")
+            return {'CANCELLED'}
+
+        # Terrain must exist
+        obj = bpy.data.objects.get("TF_Preview_Terrain")
+        if not obj:
+            self.report({'ERROR'}, "Generate terrain first")
+            return {'CANCELLED'}
+
+        # Exit any current mode
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # --- Add UV layer with orthographic top-down projection ---
+        mesh = obj.data
+        half_x = m(tile.map_width, tile.print_scale) / 2.0
+        half_y = m(tile.map_depth, tile.print_scale) / 2.0
+
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        # Remove existing road paint UV layer if present
+        existing_uv = bm.loops.layers.uv.get("TF_RoadPaint_UV")
+        if existing_uv:
+            bm.loops.layers.uv.remove(existing_uv)
+        uv_layer = bm.loops.layers.uv.new("TF_RoadPaint_UV")
+        for face in bm.faces:
+            for loop in face.loops:
+                co = loop.vert.co
+                loop[uv_layer].uv = (
+                    (co.x + half_x) / (2.0 * half_x),
+                    (co.y + half_y) / (2.0 * half_y),
+                )
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        # --- Create or reuse paint image ---
+        res = outdoor.road_paint_resolution
+        paint_img = bpy.data.images.get("TF_RoadPaint_Image")
+        if paint_img and (paint_img.size[0] != res or paint_img.size[1] != res):
+            bpy.data.images.remove(paint_img)
+            paint_img = None
+        if not paint_img:
+            paint_img = bpy.data.images.new(
+                "TF_RoadPaint_Image", width=res, height=res,
+                alpha=True, float_buffer=False,
+            )
+            paint_img.pixels[:] = [0.0] * (res * res * 4)
+
+            # Load saved progress from disk if available
+            progress_path = _road_paint_progress_path(outdoor)
+            if progress_path and os.path.isfile(progress_path):
+                saved = bpy.data.images.load(progress_path, check_existing=False)
+                if saved.size[0] == res and saved.size[1] == res:
+                    paint_img.pixels[:] = list(saved.pixels)
+                bpy.data.images.remove(saved)
+        paint_img.use_fake_user = True
+
+        # --- Compute terrain Z range for height-based coloring ---
+        min_z = float('inf')
+        max_z = float('-inf')
+        for v in mesh.vertices:
+            z = v.co.z
+            if z < min_z:
+                min_z = z
+            if z > max_z:
+                max_z = z
+        if min_z == max_z:
+            max_z = min_z + 0.001
+
+        # --- Build material ---
+        mat = bpy.data.materials.new("TF_RoadPaint_Material")
+        mat.use_nodes = True
+        tree = mat.node_tree
+        tree.nodes.clear()
+
+        # Height-based terrain coloring
+        n_texcoord = tree.nodes.new('ShaderNodeTexCoord')
+        n_texcoord.location = (-800, 300)
+
+        n_sep = tree.nodes.new('ShaderNodeSeparateXYZ')
+        n_sep.location = (-600, 300)
+
+        n_maprange = tree.nodes.new('ShaderNodeMapRange')
+        n_maprange.inputs['From Min'].default_value = min_z
+        n_maprange.inputs['From Max'].default_value = max_z
+        n_maprange.inputs['To Min'].default_value = 0.0
+        n_maprange.inputs['To Max'].default_value = 1.0
+        n_maprange.location = (-400, 300)
+
+        n_ramp = tree.nodes.new('ShaderNodeValToRGB')
+        n_ramp.location = (-150, 300)
+        # Green-to-brown terrain height visualization
+        cr = n_ramp.color_ramp
+        cr.elements[0].position = 0.0
+        cr.elements[0].color = (0.2, 0.5, 0.15, 1.0)   # green lowland
+        cr.elements[1].position = 1.0
+        cr.elements[1].color = (0.45, 0.3, 0.15, 1.0)   # brown highland
+
+        # Paint texture
+        n_paint = tree.nodes.new('ShaderNodeTexImage')
+        n_paint.name = "TF_PaintTex"
+        n_paint.image = paint_img
+        n_paint.location = (-400, -100)
+        # Set UV map to our road paint UV layer
+        n_uv = tree.nodes.new('ShaderNodeUVMap')
+        n_uv.uv_map = "TF_RoadPaint_UV"
+        n_uv.location = (-600, -100)
+
+        # Opacity multiplier
+        n_mult = tree.nodes.new('ShaderNodeMath')
+        n_mult.name = "TF_OpacityMult"
+        n_mult.operation = 'MULTIPLY'
+        n_mult.inputs[1].default_value = outdoor.road_paint_overlay_opacity
+        n_mult.location = (-100, -200)
+
+        # Mix height color (A) with paint color (B)
+        n_mix = tree.nodes.new('ShaderNodeMix')
+        n_mix.name = "TF_MixColor"
+        n_mix.data_type = 'RGBA'
+        n_mix.location = (150, 200)
+
+        n_bsdf = tree.nodes.new('ShaderNodeBsdfPrincipled')
+        n_bsdf.location = (450, 200)
+
+        n_out = tree.nodes.new('ShaderNodeOutputMaterial')
+        n_out.location = (750, 200)
+
+        # Links
+        links = tree.links
+        # Height coloring chain
+        links.new(n_texcoord.outputs['Generated'], n_sep.inputs['Vector'])
+        links.new(n_sep.outputs['Z'], n_maprange.inputs['Value'])
+        links.new(n_maprange.outputs['Result'], n_ramp.inputs['Fac'])
+        # Paint texture UV
+        links.new(n_uv.outputs['UV'], n_paint.inputs['Vector'])
+        # Opacity
+        links.new(n_paint.outputs['Alpha'], n_mult.inputs[0])
+        links.new(n_mult.outputs['Value'], n_mix.inputs['Factor'])
+        # Mix: A = height color, B = paint color
+        links.new(n_ramp.outputs['Color'], n_mix.inputs[6])
+        links.new(n_paint.outputs['Color'], n_mix.inputs[7])
+        # Output
+        links.new(n_mix.outputs[2], n_bsdf.inputs['Base Color'])
+        links.new(n_bsdf.outputs['BSDF'], n_out.inputs['Surface'])
+
+        # Set paint texture as active for texture paint mode
+        tree.nodes.active = n_paint
+
+        # --- Store original material and assign paint material ---
+        if obj.data.materials:
+            obj["TF_OrigMaterial"] = obj.data.materials[0].name
+        else:
+            obj["TF_OrigMaterial"] = ""
+        if obj.data.materials:
+            obj.data.materials[0] = mat
+        else:
+            obj.data.materials.append(mat)
+
+        # Select terrain and enter texture paint mode
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        bpy.ops.object.mode_set(mode='TEXTURE_PAINT')
+
+        # Configure brush for white (roads are binary — painted or not)
+        ip = context.tool_settings.image_paint
+        brush = ip.brush
+        if brush:
+            brush.color = (1.0, 1.0, 1.0)
+            brush.blend = 'MIX'
+            ups = ip.unified_paint_settings
+            if ups.use_unified_color:
+                ups.color = (1.0, 1.0, 1.0)
+
+        # Switch viewport to Material Preview
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D':
+                        space.shading.type = 'MATERIAL'
+                        break
+                break
+
+        outdoor.is_road_painting = True
+        self.report({'INFO'}, "Paint road paths on terrain — brush size controls road width")
+        return {'FINISHED'}
+
+
+def _restore_terrain_after_road_paint(obj):
+    """Restore terrain object after road painting — shared by Apply and Cancel."""
+    # Restore original material
+    orig_name = obj.get("TF_OrigMaterial", "")
+    if orig_name:
+        orig_mat = bpy.data.materials.get(orig_name)
+        if orig_mat and obj.data.materials:
+            obj.data.materials[0] = orig_mat
+    elif obj.data.materials:
+        # No original material stored — clear the slot
+        obj.data.materials.pop(index=0)
+
+    # Remove custom property
+    if "TF_OrigMaterial" in obj:
+        del obj["TF_OrigMaterial"]
+
+    # Remove paint material
+    mat = bpy.data.materials.get("TF_RoadPaint_Material")
+    if mat:
+        bpy.data.materials.remove(mat)
+
+    # Remove road paint UV layer
+    mesh = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    uv = bm.loops.layers.uv.get("TF_RoadPaint_UV")
+    if uv:
+        bm.loops.layers.uv.remove(uv)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+    # Remove paint image
+    paint_img = bpy.data.images.get("TF_RoadPaint_Image")
+    if paint_img:
+        bpy.data.images.remove(paint_img)
+
+
+class TILEFORGE_OT_ApplyPaintedRoad(Operator):
+    """Convert the painted overlay to a road mask and enable painted roads"""
+    bl_idname = "tileforge.apply_painted_road"
+    bl_label = "Apply Road Mask"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.tile_forge.outdoor.is_road_painting
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+
+        try:
+            # Exit paint mode
+            if context.mode == 'PAINT_TEXTURE':
+                bpy.ops.object.mode_set(mode='OBJECT')
+
+            paint_img = bpy.data.images.get("TF_RoadPaint_Image")
+            if not paint_img:
+                self.report({'ERROR'}, "No painted road image found")
+                return {'CANCELLED'}
+
+            # Copy paint image to persistent mask
+            w, h = paint_img.size
+            mask_img = bpy.data.images.get("TF_RoadPaint_Mask")
+            if mask_img and (mask_img.size[0] != w or mask_img.size[1] != h):
+                bpy.data.images.remove(mask_img)
+                mask_img = None
+            if not mask_img:
+                mask_img = bpy.data.images.new(
+                    "TF_RoadPaint_Mask", width=w, height=h,
+                    alpha=True, float_buffer=False,
+                )
+            mask_img.pixels[:] = list(paint_img.pixels)
+            mask_img.use_fake_user = True
+
+            # Enable painted road in generation pipeline
+            outdoor.add_painted_road = True
+
+            # Delete progress file — work is finalized
+            progress = _road_paint_progress_path(outdoor)
+            if progress and os.path.isfile(progress):
+                os.remove(progress)
+
+            # Restore terrain
+            obj = bpy.data.objects.get("TF_Preview_Terrain")
+            if obj:
+                _restore_terrain_after_road_paint(obj)
+
+            self.report({'INFO'}, "Road mask applied — regenerate terrain to see roads")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to apply road mask: {e}")
+            return {'CANCELLED'}
+        finally:
+            outdoor.is_road_painting = False
+
+
+class TILEFORGE_OT_CancelRoadPaint(Operator):
+    """Cancel road painting and discard the painted roads"""
+    bl_idname = "tileforge.cancel_road_paint"
+    bl_label = "Cancel"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.tile_forge.outdoor.is_road_painting
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+
+        try:
+            # Exit paint mode
+            if context.mode == 'PAINT_TEXTURE':
+                bpy.ops.object.mode_set(mode='OBJECT')
+
+            # Restore terrain
+            obj = bpy.data.objects.get("TF_Preview_Terrain")
+            if obj:
+                _restore_terrain_after_road_paint(obj)
+
+            self.report({'INFO'}, "Road paint mode cancelled")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to cancel road paint mode: {e}")
+            return {'CANCELLED'}
+        finally:
+            outdoor.is_road_painting = False
+
+
+class TILEFORGE_OT_SaveRoadPaintProgress(Operator):
+    """Save current road paint progress to disk so you can resume later"""
+    bl_idname = "tileforge.save_road_paint_progress"
+    bl_label = "Save Progress"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.tile_forge.outdoor.is_road_painting
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+
+        paint_img = bpy.data.images.get("TF_RoadPaint_Image")
+        if not paint_img:
+            self.report({'ERROR'}, "No painted road image to save")
+            return {'CANCELLED'}
+
+        progress_path = _road_paint_progress_path(outdoor)
+        if not progress_path:
+            self.report({'ERROR'}, "Save .blend file first to determine save path")
+            return {'CANCELLED'}
+
+        paint_img.filepath_raw = progress_path
+        paint_img.file_format = 'PNG'
+        paint_img.save()
+
+        self.report({'INFO'}, f"Road paint progress saved to {progress_path}")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# AI Heightmap generation
+# ---------------------------------------------------------------------------
+
+class TILEFORGE_OT_GenerateAIHeightmap(Operator):
+    """Send a color map to an AI service and receive a grayscale heightmap"""
+    bl_idname = "tileforge.generate_ai_heightmap"
+    bl_label = "Generate AI Heightmap"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        outdoor = context.scene.tile_forge.outdoor
+
+        # Resolve API key from addon preferences
+        prefs = context.preferences.addons[__package__].preferences
+        provider = outdoor.ai_provider
+        if provider == "OPENAI":
+            api_key = prefs.openai_api_key.strip()
+        else:
+            api_key = prefs.gemini_api_key.strip()
+
+        image_path = bpy.path.abspath(outdoor.ai_source_image)
+
+        context.window.cursor_set('WAIT')
+        try:
+            out_path = ai_api.generate_heightmap(
+                provider, api_key, image_path, outdoor.ai_custom_prompt,
+            )
+        except (ValueError, ConnectionError) as e:
+            context.window.cursor_set('DEFAULT')
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        context.window.cursor_set('DEFAULT')
+
+        # Wire result into the Custom Heightmap pipeline
+        outdoor.heightmap_image = out_path
+        outdoor.terrain_type = "CUSTOM"
+
+        self.report({'INFO'}, f"AI heightmap saved to {out_path}")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
 # Cleanup utility
 # ---------------------------------------------------------------------------
 
@@ -852,20 +1374,32 @@ class TILEFORGE_OT_CleanupAll(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        # Exit paint mode before removing objects
+        outdoor = context.scene.tile_forge.outdoor
+        if outdoor.is_painting or outdoor.is_road_painting:
+            if context.mode == 'PAINT_TEXTURE':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            outdoor.is_painting = False
+            outdoor.is_road_painting = False
+
         count = 0
         count += _remove_objects_by_prefix("TF_Preview")
         count += _remove_objects_by_prefix("tile_r")
         count += _remove_objects_by_prefix("TF_Paint_")
-
-        # Reset painting state
-        outdoor = context.scene.tile_forge.outdoor
-        if outdoor.is_painting:
-            if context.mode == 'PAINT_TEXTURE':
-                bpy.ops.object.mode_set(mode='OBJECT')
-            outdoor.is_painting = False
+        count += _remove_objects_by_prefix("TF_Road_")
+        count += _remove_objects_by_prefix("TF_RoadPaint_")
         mat = bpy.data.materials.get("TF_Paint_Material")
         if mat:
             bpy.data.materials.remove(mat)
+        mat = bpy.data.materials.get("TF_RoadPaint_Material")
+        if mat:
+            bpy.data.materials.remove(mat)
+
+        # Remove paint-related images
+        for img_name in ("TF_Paint_Heightmap", "TF_RoadPaint_Image", "TF_RoadPaint_Mask"):
+            img = bpy.data.images.get(img_name)
+            if img:
+                bpy.data.images.remove(img)
 
         self.report({'INFO'}, f"Removed {count} objects")
         return {'FINISHED'}
@@ -893,6 +1427,14 @@ def _paint_progress_path(outdoor):
     return os.path.join(os.path.dirname(ref), "tileforge_paint_progress.png")
 
 
+def _road_paint_progress_path(outdoor):
+    """Return deterministic path for road paint progress file next to the .blend file."""
+    blend = bpy.data.filepath
+    if not blend:
+        return ""
+    return os.path.join(os.path.dirname(blend), "tileforge_road_paint_progress.png")
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -908,11 +1450,18 @@ _classes = (
     TILEFORGE_OT_RemoveNoiseLayer,
     TILEFORGE_OT_AddColorZone,
     TILEFORGE_OT_RemoveColorZone,
+    TILEFORGE_OT_AddRoadSegment,
+    TILEFORGE_OT_RemoveRoadSegment,
     TILEFORGE_OT_SetupHeightmapPaint,
     TILEFORGE_OT_SetBrushHeight,
     TILEFORGE_OT_ApplyPaintedHeightmap,
     TILEFORGE_OT_CancelPaintMode,
     TILEFORGE_OT_SavePaintProgress,
+    TILEFORGE_OT_SetupRoadPaint,
+    TILEFORGE_OT_ApplyPaintedRoad,
+    TILEFORGE_OT_CancelRoadPaint,
+    TILEFORGE_OT_SaveRoadPaintProgress,
+    TILEFORGE_OT_GenerateAIHeightmap,
     TILEFORGE_OT_CleanupAll,
 )
 

@@ -6,6 +6,7 @@ Supports outdoor terrain (heightmap/procedural) and dungeon/interior maps
 with configurable tile sizes, interlocking connectors, and batch STL export.
 """
 
+from . import ai_api
 from . import properties
 from . import operators
 from . import ui

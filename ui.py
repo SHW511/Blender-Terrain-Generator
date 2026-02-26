@@ -126,7 +126,7 @@ class TILEFORGE_PT_TileSettings(TILEFORGE_PT_Base, Panel):
 
 
 # ---------------------------------------------------------------------------
-# Outdoor Terrain
+# Outdoor Terrain (parent panel — essential workflow only)
 # ---------------------------------------------------------------------------
 
 class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
@@ -160,6 +160,10 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
             row = crop_box.row(align=True)
             row.prop(outdoor, "crop_top", text="T")
             row.prop(outdoor, "crop_bottom", text="B")
+
+            col.separator()
+            col.prop(outdoor, "map_smoothing")
+            col.prop(outdoor, "edge_preserve_strength")
 
         elif outdoor.terrain_type == "MAP_IMAGE":
             col.prop(outdoor, "heightmap_image")
@@ -212,6 +216,83 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
             row = col.row(align=True)
             row.prop(outdoor, "noise_seed")
             row.operator("tileforge.randomize_seed", text="", icon='FILE_REFRESH')
+
+        layout.separator()
+
+        col = layout.column(align=True)
+        col.prop(outdoor, "terrain_height_min")
+        col.prop(outdoor, "terrain_height_max")
+        col.prop(outdoor, "height_exponent")
+        col.prop(outdoor, "subdivisions")
+
+        # Show physical relief range
+        tile = context.scene.tile_forge.tile
+        ps = tile.print_scale
+        relief_min_mm = outdoor.terrain_height_min / ps * 1000
+        relief_max_mm = outdoor.terrain_height_max / ps * 1000
+        base_mm = tile.base_height
+        col.label(text=f"  Relief: {relief_min_mm:.1f} \u2013 {relief_max_mm:.1f} mm (+ {base_mm:.1f} mm base)")
+
+        layout.separator()
+
+        # Generate button — always visible at the top level
+        layout.operator(
+            "tileforge.generate_terrain",
+            text="Generate Terrain",
+            icon='RNDCURVE',
+        )
+
+
+# ---------------------------------------------------------------------------
+# Outdoor Sub-panel: Heightmap Tools
+# ---------------------------------------------------------------------------
+
+class TILEFORGE_PT_OutdoorHeightmapTools(TILEFORGE_PT_Base, Panel):
+    bl_idname = "TILEFORGE_PT_outdoor_heightmap_tools"
+    bl_label = "Heightmap Tools"
+    bl_parent_id = "TILEFORGE_PT_outdoor"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.tile_forge.generation_mode == 'OUTDOOR'
+
+    def draw(self, context):
+        layout = self.layout
+        outdoor = context.scene.tile_forge.outdoor
+
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        # AI Heightmap generation
+        box = layout.box()
+        box.label(text="AI Heightmap", icon='IMAGE_DATA')
+        col = box.column(align=True)
+        col.prop(outdoor, "ai_source_image")
+        col.prop(outdoor, "ai_provider")
+        col.prop(outdoor, "ai_custom_prompt")
+
+        # Check if the API key is set for the selected provider
+        _has_key = False
+        try:
+            prefs = context.preferences.addons[__package__].preferences
+            if outdoor.ai_provider == "OPENAI":
+                _has_key = bool(prefs.openai_api_key.strip())
+            else:
+                _has_key = bool(prefs.gemini_api_key.strip())
+        except KeyError:
+            pass
+
+        if not _has_key:
+            col.label(text="API key not set (see Preferences)", icon='ERROR')
+
+        row = col.row()
+        row.enabled = _has_key and bool(outdoor.ai_source_image)
+        row.operator(
+            "tileforge.generate_ai_heightmap",
+            text="Generate Heightmap",
+            icon='PLAY',
+        )
 
         layout.separator()
 
@@ -276,101 +357,134 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
                 icon='X',
             )
 
-        layout.separator()
 
-        col = layout.column(align=True)
-        col.prop(outdoor, "terrain_height_min")
-        col.prop(outdoor, "terrain_height_max")
-        col.prop(outdoor, "height_exponent")
-        col.prop(outdoor, "subdivisions")
+# ---------------------------------------------------------------------------
+# Outdoor Sub-panel: Terrain Shaping
+# ---------------------------------------------------------------------------
 
-        # Show physical relief range
-        tile = context.scene.tile_forge.tile
-        ps = tile.print_scale
-        relief_min_mm = outdoor.terrain_height_min / ps * 1000
-        relief_max_mm = outdoor.terrain_height_max / ps * 1000
-        base_mm = tile.base_height
-        col.label(text=f"  Relief: {relief_min_mm:.1f} \u2013 {relief_max_mm:.1f} mm (+ {base_mm:.1f} mm base)")
+class TILEFORGE_PT_OutdoorShaping(TILEFORGE_PT_Base, Panel):
+    bl_idname = "TILEFORGE_PT_outdoor_shaping"
+    bl_label = "Terrain Shaping"
+    bl_parent_id = "TILEFORGE_PT_outdoor"
+    bl_options = {'DEFAULT_CLOSED'}
 
-        layout.separator()
+    @classmethod
+    def poll(cls, context):
+        return context.scene.tile_forge.generation_mode == 'OUTDOOR'
 
-        # Terrain Shaping
-        box = layout.box()
-        box.label(text="Terrain Shaping", icon='MOD_SMOOTH')
+    def draw(self, context):
+        layout = self.layout
+        outdoor = context.scene.tile_forge.outdoor
+
+        layout.use_property_split = True
+        layout.use_property_decorate = False
 
         # Domain warping (hidden for image-based modes)
         if outdoor.terrain_type not in ("CUSTOM", "MAP_IMAGE"):
-            col = box.column(align=True)
+            col = layout.column(align=True)
             col.prop(outdoor, "enable_domain_warp")
             if outdoor.enable_domain_warp:
                 col.prop(outdoor, "warp_strength")
                 col.prop(outdoor, "warp_scale")
 
-            box.separator()
+            layout.separator()
 
         # Terracing (available for procedural and color-map modes)
         if outdoor.terrain_type != "CUSTOM":
-            col = box.column(align=True)
+            col = layout.column(align=True)
             col.prop(outdoor, "enable_terracing")
             if outdoor.enable_terracing:
                 col.prop(outdoor, "terrace_levels")
                 col.prop(outdoor, "terrace_sharpness")
 
-            box.separator()
+            layout.separator()
 
         # Slope clamping (always visible — works for heightmaps too)
-        col = box.column(align=True)
+        col = layout.column(align=True)
         col.prop(outdoor, "enable_slope_clamp")
         if outdoor.enable_slope_clamp:
             col.prop(outdoor, "max_slope_angle")
 
-        layout.separator()
 
-        # Noise Layers (hidden for image-based modes)
-        if outdoor.terrain_type not in ("CUSTOM", "MAP_IMAGE"):
-            box = layout.box()
-            box.label(text="Noise Layers", icon='NODETREE')
+# ---------------------------------------------------------------------------
+# Outdoor Sub-panel: Noise Layers
+# ---------------------------------------------------------------------------
 
-            col = box.column(align=True)
-            col.prop(outdoor, "enable_noise_layers")
+class TILEFORGE_PT_OutdoorNoiseLayers(TILEFORGE_PT_Base, Panel):
+    bl_idname = "TILEFORGE_PT_outdoor_noise_layers"
+    bl_label = "Noise Layers"
+    bl_parent_id = "TILEFORGE_PT_outdoor"
+    bl_options = {'DEFAULT_CLOSED'}
 
-            if outdoor.enable_noise_layers:
-                for i, layer in enumerate(outdoor.noise_layers):
-                    layer_box = box.box()
-                    header = layer_box.row(align=True)
-                    header.prop(layer, "enabled", text="")
-                    header.prop(layer, "layer_name", text="")
-                    header.label(text=f"#{i + 1}")
+    @classmethod
+    def poll(cls, context):
+        tf = context.scene.tile_forge
+        return (tf.generation_mode == 'OUTDOOR'
+                and tf.outdoor.terrain_type not in ("CUSTOM", "MAP_IMAGE"))
 
-                    if layer.enabled:
-                        col2 = layer_box.column(align=True)
-                        col2.prop(layer, "noise_type")
-                        if layer.noise_type != 'VORONOI':
-                            col2.prop(layer, "noise_basis")
-                        col2.prop(layer, "scale")
-                        col2.prop(layer, "strength")
-                        col2.prop(layer, "octaves")
-                        col2.prop(layer, "blend_mode")
-                        col2.prop(layer, "seed_offset")
+    def draw(self, context):
+        layout = self.layout
+        outdoor = context.scene.tile_forge.outdoor
 
-                        col2.separator()
-                        col2.prop(layer, "use_mask")
-                        if layer.use_mask:
-                            col2.prop(layer, "mask_invert")
-                            col2.prop(layer, "mask_contrast")
+        layout.use_property_split = True
+        layout.use_property_decorate = False
 
-                row = box.row(align=True)
-                row.operator("tileforge.add_noise_layer", text="Add Layer", icon='ADD')
-                row.operator("tileforge.remove_noise_layer", text="Remove", icon='REMOVE')
+        col = layout.column(align=True)
+        col.prop(outdoor, "enable_noise_layers")
 
-            layout.separator()
+        if outdoor.enable_noise_layers:
+            for i, layer in enumerate(outdoor.noise_layers):
+                layer_box = layout.box()
+                header = layer_box.row(align=True)
+                header.prop(layer, "enabled", text="")
+                header.prop(layer, "layer_name", text="")
+                header.label(text=f"#{i + 1}")
 
-        # Erosion
-        box = layout.box()
-        box.label(text="Erosion", icon='FORCE_WIND')
+                if layer.enabled:
+                    col2 = layer_box.column(align=True)
+                    col2.prop(layer, "noise_type")
+                    if layer.noise_type != 'VORONOI':
+                        col2.prop(layer, "noise_basis")
+                    col2.prop(layer, "scale")
+                    col2.prop(layer, "strength")
+                    col2.prop(layer, "octaves")
+                    col2.prop(layer, "blend_mode")
+                    col2.prop(layer, "seed_offset")
+
+                    col2.separator()
+                    col2.prop(layer, "use_mask")
+                    if layer.use_mask:
+                        col2.prop(layer, "mask_invert")
+                        col2.prop(layer, "mask_contrast")
+
+            row = layout.row(align=True)
+            row.operator("tileforge.add_noise_layer", text="Add Layer", icon='ADD')
+            row.operator("tileforge.remove_noise_layer", text="Remove", icon='REMOVE')
+
+
+# ---------------------------------------------------------------------------
+# Outdoor Sub-panel: Erosion
+# ---------------------------------------------------------------------------
+
+class TILEFORGE_PT_OutdoorErosion(TILEFORGE_PT_Base, Panel):
+    bl_idname = "TILEFORGE_PT_outdoor_erosion"
+    bl_label = "Erosion"
+    bl_parent_id = "TILEFORGE_PT_outdoor"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.tile_forge.generation_mode == 'OUTDOOR'
+
+    def draw(self, context):
+        layout = self.layout
+        outdoor = context.scene.tile_forge.outdoor
+
+        layout.use_property_split = True
+        layout.use_property_decorate = False
 
         # Hydraulic erosion
-        col = box.column(align=True)
+        col = layout.column(align=True)
         col.prop(outdoor, "enable_hydraulic_erosion")
         if outdoor.enable_hydraulic_erosion:
             col.prop(outdoor, "hydraulic_preset")
@@ -385,17 +499,37 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
                 col.prop(outdoor, "hydraulic_min_slope")
                 col.prop(outdoor, "hydraulic_radius")
 
-        box.separator()
+        layout.separator()
 
         # Thermal erosion
-        col = box.column(align=True)
+        col = layout.column(align=True)
         col.prop(outdoor, "enable_thermal_erosion")
         if outdoor.enable_thermal_erosion:
             col.prop(outdoor, "thermal_talus_angle")
             col.prop(outdoor, "thermal_iterations")
             col.prop(outdoor, "thermal_strength")
 
-        layout.separator()
+
+# ---------------------------------------------------------------------------
+# Outdoor Sub-panel: Surface & Features
+# ---------------------------------------------------------------------------
+
+class TILEFORGE_PT_OutdoorSurface(TILEFORGE_PT_Base, Panel):
+    bl_idname = "TILEFORGE_PT_outdoor_surface"
+    bl_label = "Surface & Features"
+    bl_parent_id = "TILEFORGE_PT_outdoor"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.tile_forge.generation_mode == 'OUTDOOR'
+
+    def draw(self, context):
+        layout = self.layout
+        outdoor = context.scene.tile_forge.outdoor
+
+        layout.use_property_split = True
+        layout.use_property_decorate = False
 
         # Ground texture
         col = layout.column(align=True)
@@ -408,6 +542,24 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
         # Terrain features
         box = layout.box()
         box.label(text="Terrain Features", icon='MESH_PLANE')
+
+        col = box.column(align=True)
+        col.prop(outdoor, "add_cliff")
+        if outdoor.add_cliff:
+            col.prop(outdoor, "cliff_curve")
+            col.prop(outdoor, "cliff_height")
+            col.prop(outdoor, "cliff_steepness")
+
+        box.separator()
+
+        col = box.column(align=True)
+        col.prop(outdoor, "add_ridge")
+        if outdoor.add_ridge:
+            col.prop(outdoor, "ridge_curve")
+            col.prop(outdoor, "ridge_width")
+            col.prop(outdoor, "ridge_height")
+
+        box.separator()
 
         col = box.column(align=True)
         col.prop(outdoor, "add_river")
@@ -424,15 +576,89 @@ class TILEFORGE_PT_OutdoorTerrain(TILEFORGE_PT_Base, Panel):
         if outdoor.add_path:
             col.prop(outdoor, "path_curve")
             col.prop(outdoor, "path_width")
+            col.prop(outdoor, "path_depth")
 
-        layout.separator()
+        box.separator()
 
-        # Generate button
-        layout.operator(
-            "tileforge.generate_terrain",
-            text="Generate Terrain",
-            icon='RNDCURVE',
-        )
+        col = box.column(align=True)
+        col.prop(outdoor, "add_road_network")
+        if outdoor.add_road_network:
+            col.prop(outdoor, "road_width")
+            col.prop(outdoor, "road_depth")
+            col.prop(outdoor, "road_slope_weight")
+            col.prop(outdoor, "road_smoothing")
+            col.prop(outdoor, "road_create_curve")
+
+            col.separator()
+
+            for i, seg in enumerate(outdoor.road_segments):
+                seg_box = col.box()
+                header = seg_box.row(align=True)
+                header.prop(seg, "enabled", text="")
+                header.prop(seg, "segment_name", text="")
+                header.label(text=f"#{i + 1}")
+                if seg.enabled:
+                    seg_col = seg_box.column(align=True)
+                    seg_col.prop(seg, "waypoint_start")
+                    seg_col.prop(seg, "waypoint_end")
+
+            row = col.row(align=True)
+            row.operator("tileforge.add_road_segment", text="Add Segment", icon='ADD')
+            row.operator("tileforge.remove_road_segment", text="Remove", icon='REMOVE')
+
+        box.separator()
+
+        # Painted Roads
+        # Safety check: reset is_road_painting if terrain or paint material was removed
+        if outdoor.is_road_painting:
+            terrain = bpy.data.objects.get("TF_Preview_Terrain")
+            mat = bpy.data.materials.get("TF_RoadPaint_Material")
+            if not terrain or not mat:
+                outdoor.is_road_painting = False
+
+        col = box.column(align=True)
+        col.prop(outdoor, "add_painted_road")
+        if outdoor.add_painted_road:
+            col.prop(outdoor, "road_paint_depth")
+            col.prop(outdoor, "road_paint_blend")
+            col.prop(outdoor, "road_paint_texture")
+            if outdoor.road_paint_texture != 'NONE':
+                col.prop(outdoor, "road_paint_texture_strength")
+                col.prop(outdoor, "road_paint_texture_scale")
+                if outdoor.road_paint_texture == 'COBBLESTONE':
+                    col.prop(outdoor, "road_paint_cobble_density")
+
+            if not outdoor.is_road_painting:
+                col.separator()
+                col.prop(outdoor, "road_paint_resolution")
+                col.operator(
+                    "tileforge.setup_road_paint",
+                    text="Paint Roads",
+                    icon='BRUSHES_ALL',
+                )
+                # Show status if mask exists
+                if bpy.data.images.get("TF_RoadPaint_Mask"):
+                    col.label(text="Road mask loaded", icon='CHECKMARK')
+            else:
+                col.separator()
+                col.prop(outdoor, "road_paint_overlay_opacity", slider=True)
+                col.operator(
+                    "tileforge.save_road_paint_progress",
+                    text="Save Progress",
+                    icon='FILE_TICK',
+                )
+                col.separator()
+                row = col.row(align=True)
+                row.operator(
+                    "tileforge.apply_painted_road",
+                    text="Apply Road Mask",
+                    icon='CHECKMARK',
+                )
+                row.operator(
+                    "tileforge.cancel_road_paint",
+                    text="Cancel",
+                    icon='X',
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -468,13 +694,6 @@ class TILEFORGE_PT_Dungeon(TILEFORGE_PT_Base, Panel):
 
         col = layout.column(align=True)
         col.prop(dungeon, "wall_height")
-        col.prop(dungeon, "wall_thickness")
-
-        layout.separator()
-
-        col = layout.column(align=True)
-        col.prop(dungeon, "doorway_width")
-        col.prop(dungeon, "doorway_height")
 
         layout.separator()
 
@@ -482,17 +701,6 @@ class TILEFORGE_PT_Dungeon(TILEFORGE_PT_Base, Panel):
         col.prop(dungeon, "floor_texture")
         if dungeon.floor_texture != 'NONE':
             col.prop(dungeon, "texture_strength")
-
-        layout.separator()
-
-        # Stairs
-        box = layout.box()
-        box.label(text="Elevation", icon='MOD_ARRAY')
-        col = box.column(align=True)
-        col.prop(dungeon, "add_stairs")
-        if dungeon.add_stairs:
-            col.prop(dungeon, "stair_step_height")
-            col.prop(dungeon, "stair_step_depth")
 
         layout.separator()
 
@@ -581,6 +789,11 @@ _classes = (
     TILEFORGE_PT_Main,
     TILEFORGE_PT_TileSettings,
     TILEFORGE_PT_OutdoorTerrain,
+    TILEFORGE_PT_OutdoorHeightmapTools,
+    TILEFORGE_PT_OutdoorShaping,
+    TILEFORGE_PT_OutdoorNoiseLayers,
+    TILEFORGE_PT_OutdoorErosion,
+    TILEFORGE_PT_OutdoorSurface,
     TILEFORGE_PT_Dungeon,
     TILEFORGE_PT_SliceExport,
 )

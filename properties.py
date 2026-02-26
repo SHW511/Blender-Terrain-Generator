@@ -18,7 +18,7 @@ from bpy.props import (
     PointerProperty,
     StringProperty,
 )
-from bpy.types import PropertyGroup
+from bpy.types import AddonPreferences, PropertyGroup
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +77,14 @@ FLOOR_TEXTURES = [
     ("DIRT", "Dirt / Earth", "Rough organic ground texture"),
 ]
 
+ROAD_TEXTURES = [
+    ("NONE", "Same as Terrain", "Use the same texture as surrounding terrain"),
+    ("COBBLESTONE", "Cobblestone", "Irregular cobblestone pattern"),
+    ("STONE_SLAB", "Stone Slab", "Rectangular stone slab pattern"),
+    ("FLAGSTONE", "Flagstone", "Jittered rectangular flagstone pattern"),
+    ("WOOD_PLANK", "Wood Plank", "Parallel wood plank lines"),
+]
+
 NOISE_BLEND_MODES = [
     ("ADD", "Add", "Add layer height to base"),
     ("MULTIPLY", "Multiply", "Multiply base height by layer value"),
@@ -88,6 +96,11 @@ HYDRAULIC_PRESETS = [
     ("LIGHT", "Light", "Subtle weathering — soft channels"),
     ("MEDIUM", "Medium", "Balanced erosion — visible valleys"),
     ("HEAVY", "Heavy", "Aggressive carving — deep gorges"),
+]
+
+AI_PROVIDERS = [
+    ("GEMINI", "Gemini", "Google Gemini (fast, free tier available)"),
+    ("OPENAI", "OpenAI", "OpenAI gpt-image-1"),
 ]
 
 GRID_PRESETS = [
@@ -112,6 +125,35 @@ def _update_grid_preset(self, context):
     self.grid_squares = gs_x
     self.tile_size_x = max(1.5, min(18.0, round(gs_x * sq_mm * ps / 1000, 4)))
     self.tile_size_y = max(1.5, min(18.0, round(gs_y * sq_mm * ps / 1000, 4)))
+
+
+# ---------------------------------------------------------------------------
+# Addon Preferences (API keys)
+# ---------------------------------------------------------------------------
+
+class TILEFORGE_AddonPreferences(AddonPreferences):
+    bl_idname = __package__
+
+    openai_api_key: StringProperty(
+        name="OpenAI API Key",
+        description="API key for OpenAI (gpt-image-1). Stored in plain text in Blender preferences",
+    )
+    gemini_api_key: StringProperty(
+        name="Gemini API Key",
+        description="API key for Google Gemini. Stored in plain text in Blender preferences",
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        # Show key fields with a masked display hint — PASSWORD subtype
+        # has a 128-char buffer limit which truncates long API keys
+        col = layout.column(align=True)
+        col.prop(self, "openai_api_key")
+        if self.openai_api_key:
+            col.label(text=f"  Key length: {len(self.openai_api_key)} chars", icon='KEYINGSET')
+        col.prop(self, "gemini_api_key")
+        if self.gemini_api_key:
+            col.label(text=f"  Key length: {len(self.gemini_api_key)} chars", icon='KEYINGSET')
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +396,16 @@ def _update_paint_opacity(self, context):
         node.inputs[1].default_value = self.paint_overlay_opacity
 
 
+def _update_road_paint_opacity(self, context):
+    """Update the road paint overlay opacity in the material node tree."""
+    mat = bpy.data.materials.get("TF_RoadPaint_Material")
+    if not mat or not mat.node_tree:
+        return
+    node = mat.node_tree.nodes.get("TF_OpacityMult")
+    if node:
+        node.inputs[1].default_value = self.road_paint_overlay_opacity
+
+
 def _update_hydraulic_preset(self, context):
     """Set advanced hydraulic params from preset selection."""
     presets = {
@@ -401,6 +453,35 @@ class TILEFORGE_PG_ColorZone(PropertyGroup):
     )
 
 
+def _poll_empty(self, obj):
+    return obj.type == 'EMPTY'
+
+
+class TILEFORGE_PG_RoadSegment(PropertyGroup):
+    """A single road segment connecting two waypoint empties."""
+
+    enabled: BoolProperty(
+        name="Enabled",
+        default=True,
+    )
+    segment_name: StringProperty(
+        name="Name",
+        default="Road",
+    )
+    waypoint_start: PointerProperty(
+        name="Start",
+        description="Empty object marking the road start",
+        type=bpy.types.Object,
+        poll=_poll_empty,
+    )
+    waypoint_end: PointerProperty(
+        name="End",
+        description="Empty object marking the road end",
+        type=bpy.types.Object,
+        poll=_poll_empty,
+    )
+
+
 class TILEFORGE_PG_OutdoorSettings(PropertyGroup):
     """Settings for outdoor terrain generation."""
 
@@ -424,6 +505,22 @@ class TILEFORGE_PG_OutdoorSettings(PropertyGroup):
         name="Heightmap Image",
         description="Path to grayscale heightmap image",
         subtype='FILE_PATH',
+    )
+
+    # AI heightmap generation
+    ai_source_image: StringProperty(
+        name="Source Map",
+        description="Color battle map image to convert to a heightmap via AI",
+        subtype='FILE_PATH',
+    )
+    ai_provider: EnumProperty(
+        name="AI Provider",
+        items=AI_PROVIDERS,
+        default="GEMINI",
+    )
+    ai_custom_prompt: StringProperty(
+        name="Extra Prompt",
+        description="Optional extra instructions appended to the default AI prompt",
     )
 
     # Crop margins (used by CUSTOM and MAP_IMAGE modes)
@@ -602,7 +699,7 @@ class TILEFORGE_PG_OutdoorSettings(PropertyGroup):
         description="Resolution of the terrain mesh (higher = more detail, slower)",
         default=128,
         min=8,
-        max=512,
+        max=1024,
     )
 
     # Domain warping
@@ -861,6 +958,204 @@ class TILEFORGE_PG_OutdoorSettings(PropertyGroup):
         step=10,
         precision=1,
     )
+    path_depth: FloatProperty(
+        name="Road Depression (m)",
+        description="How deep the road surface sits below surrounding terrain",
+        default=0.0,
+        min=0.0,
+        max=0.3,
+        step=1,
+        precision=2,
+    )
+
+    # Procedural road network
+    add_road_network: BoolProperty(
+        name="Add Road Network",
+        description="Auto-generate roads between waypoint empties using A* pathfinding",
+        default=False,
+    )
+    road_segments: CollectionProperty(type=TILEFORGE_PG_RoadSegment)
+    active_road_segment_index: IntProperty(
+        name="Active Segment",
+        default=0,
+    )
+    road_width: FloatProperty(
+        name="Road Width (m)",
+        description="Width of procedural roads in world meters",
+        default=1.5,
+        min=0.3,
+        max=4.0,
+        step=10,
+        precision=1,
+    )
+    road_depth: FloatProperty(
+        name="Road Depression (m)",
+        description="How deep the road surface sits below surrounding terrain",
+        default=0.02,
+        min=0.0,
+        max=0.3,
+        step=1,
+        precision=2,
+    )
+    road_slope_weight: FloatProperty(
+        name="Slope Avoidance",
+        description="How strongly roads avoid steep terrain (0=straight line, 20=strongly avoids slopes)",
+        default=5.0,
+        min=0.0,
+        max=20.0,
+        step=50,
+        precision=1,
+    )
+    road_smoothing: IntProperty(
+        name="Smoothing Passes",
+        description="Laplacian smoothing iterations for natural curves",
+        default=3,
+        min=0,
+        max=10,
+    )
+    road_create_curve: BoolProperty(
+        name="Create Curve Object",
+        description="Generate a visible curve object for each road segment",
+        default=True,
+    )
+
+    # Painted road mask
+    add_painted_road: BoolProperty(
+        name="Add Painted Road",
+        description="Flatten terrain along a painted road mask",
+        default=False,
+    )
+    road_paint_resolution: IntProperty(
+        name="Paint Resolution",
+        description="Pixel resolution of the road paint image",
+        default=1024,
+        min=256, max=4096,
+    )
+    road_paint_overlay_opacity: FloatProperty(
+        name="Paint Opacity",
+        description="Opacity of the painted road overlay on top of terrain height colors",
+        default=0.7,
+        min=0.1, max=1.0,
+        step=5,
+        precision=2,
+        update=_update_road_paint_opacity,
+    )
+    is_road_painting: BoolProperty(
+        default=False,
+        options={'HIDDEN', 'SKIP_SAVE'},
+    )
+    road_paint_depth: FloatProperty(
+        name="Road Depression (m)",
+        description="How deep the painted road surface sits below surrounding terrain",
+        default=0.02,
+        min=0.0,
+        max=0.3,
+        step=1,
+        precision=2,
+    )
+    road_paint_blend: FloatProperty(
+        name="Edge Blend",
+        description="Edge blend sharpness (0=hard edges, 1=smooth transitions)",
+        default=0.5,
+        min=0.0,
+        max=1.0,
+        step=5,
+        precision=2,
+    )
+    road_paint_texture: EnumProperty(
+        name="Road Texture",
+        items=ROAD_TEXTURES,
+        default="COBBLESTONE",
+    )
+    road_paint_texture_strength: FloatProperty(
+        name="Road Texture Strength",
+        description="Intensity of road surface texture displacement",
+        default=0.4,
+        min=0.0,
+        max=1.0,
+        step=5,
+        precision=2,
+    )
+    road_paint_texture_scale: FloatProperty(
+        name="Road Texture Scale",
+        description="Scale multiplier for road texture pattern (higher = finer stones)",
+        default=2.0,
+        min=0.5,
+        max=5.0,
+        step=10,
+        precision=1,
+    )
+    road_paint_cobble_density: FloatProperty(
+        name="Stone Density",
+        description="How tightly packed cobblestones are (0=wide gaps, 1=nearly touching)",
+        default=0.5,
+        min=0.0,
+        max=1.0,
+        step=5,
+        precision=2,
+    )
+
+    # Ridge line
+    add_ridge: BoolProperty(
+        name="Add Ridge Line",
+        description="Raise a ridge along a curve",
+        default=False,
+    )
+    ridge_curve: PointerProperty(
+        name="Ridge Curve",
+        description="Curve object defining the ridge centerline",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'CURVE',
+    )
+    ridge_width: FloatProperty(
+        name="Ridge Width (m)",
+        description="Width of the ridge in world meters",
+        default=1.0,
+        min=0.3,
+        max=3.0,
+        step=10,
+        precision=1,
+    )
+    ridge_height: FloatProperty(
+        name="Ridge Height (m)",
+        description="How high the ridge rises above surrounding terrain",
+        default=0.3,
+        min=0.05,
+        max=1.0,
+        step=5,
+        precision=2,
+    )
+
+    # Cliff / escarpment
+    add_cliff: BoolProperty(
+        name="Add Cliff",
+        description="Add a cliff drop-off along a curve",
+        default=False,
+    )
+    cliff_curve: PointerProperty(
+        name="Cliff Curve",
+        description="Curve object defining the cliff edge line",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'CURVE',
+    )
+    cliff_height: FloatProperty(
+        name="Cliff Height (m)",
+        description="Height of the cliff drop in world meters",
+        default=0.4,
+        min=0.1,
+        max=1.5,
+        step=5,
+        precision=2,
+    )
+    cliff_steepness: FloatProperty(
+        name="Cliff Steepness",
+        description="How abrupt the cliff transition is (0=gradual slope, 1=near-vertical)",
+        default=0.8,
+        min=0.0,
+        max=1.0,
+        step=5,
+        precision=2,
+    )
 
     floor_texture: EnumProperty(
         name="Ground Texture",
@@ -1027,6 +1322,7 @@ _classes = (
     TILEFORGE_PG_TileSettings,
     TILEFORGE_PG_NoiseLayer,
     TILEFORGE_PG_ColorZone,
+    TILEFORGE_PG_RoadSegment,
     TILEFORGE_PG_OutdoorSettings,
     TILEFORGE_PG_DungeonSettings,
     TILEFORGE_PG_ExportSettings,
@@ -1035,6 +1331,7 @@ _classes = (
 
 
 def register():
+    bpy.utils.register_class(TILEFORGE_AddonPreferences)
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.tile_forge = PointerProperty(type=TILEFORGE_PG_Main)
@@ -1044,3 +1341,4 @@ def unregister():
     del bpy.types.Scene.tile_forge
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
+    bpy.utils.unregister_class(TILEFORGE_AddonPreferences)
