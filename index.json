@@ -1,0 +1,30 @@
+{
+  "version": "v1",
+  "blocklist": [],
+  "data": [
+    {
+      "schema_version": "1.0.0",
+      "id": "dnd_tile_forge",
+      "version": "0.1.1",
+      "name": "D&D Tile Forge",
+      "tagline": "Generate 3D-printable modular terrain tiles for tabletop RPGs",
+      "maintainer": "Zerg",
+      "type": "add-on",
+      "license": [
+        "SPDX:GPL-3.0-or-later"
+      ],
+      "blender_version_min": "5.0.0",
+      "tags": [
+        "3D View",
+        "Mesh"
+      ],
+      "permissions": {
+        "files": "Export STL tile files to disk",
+        "network": "Send map images to AI services (OpenAI/Google Gemini) for heightmap generation"
+      },
+      "archive_url": "./dnd_tile_forge-0.1.1.zip",
+      "archive_size": 51130,
+      "archive_hash": "sha256:a2f06c39f9925eb051becc81b0e26ee8583cb32d76e061281379e993e9cddabd"
+    }
+  ]
+}
