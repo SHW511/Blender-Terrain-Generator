@@ -2,6 +2,15 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - Major
+          - Minor
+          - Patch
 
 jobs:
   release:
@@ -14,6 +23,36 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Bump version
+        id: bump
+        run: |
+          set -euo pipefail
+          CURRENT=$(grep -m1 '^version\s*=' blender_manifest.toml | sed 's/^version\s*=\s*"\(.*\)".*/\1/')
+          if [ -z "$CURRENT" ]; then
+            echo "Error: version not found in blender_manifest.toml" >&2
+            exit 1
+          fi
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          BUMP="${{ github.event.inputs.version_bump }}"
+          if [ "$BUMP" = "Major" ]; then
+            MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+          elif [ "$BUMP" = "Minor" ]; then
+            MINOR=$((MINOR + 1)); PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" blender_manifest.toml
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add blender_manifest.toml
+          git diff --cached --quiet || git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }}"
+          git push
 
       - name: Get version
         id: version
