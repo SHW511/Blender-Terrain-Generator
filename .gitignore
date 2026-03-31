@@ -174,3 +174,4 @@ __marimo__/
 
 # Claude Code project config
 .claude/
+/.vs
